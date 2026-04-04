@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(canon_env/Scripts/python.exe -c \":*)",
+      "Bash(python3 -c \":*)",
+      "Bash(where python:*)",
+      "Bash(where py:*)",
+      "Read(//c/Users/dongs/AppData/Local/Programs/Python//**)",
+      "Bash(py -c \":*)",
+      "Bash(py -c \"import ast; ast.parse\\(open\\(''gui/tab_monitor.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''문법 OK''\\)\")",
+      "Bash(du -sh \"C:/Users/dongs/Desktop/머신러닝 캐논 2.1 - 복사본/models/canon_fast_yolo/weights\"/*)",
+      "Bash(mv gui_old/* _archive/gui_old/)",
+      "Bash(mv test_collision.py test_detect.py test_matcher_load.py test_qt_torch.py test_yolo_load.py test_yolo_only.py _archive/test_scripts/)",
+      "Bash(mv scripts/fps_benchmark.py _archive/)"
+    ]
+  }
+}
