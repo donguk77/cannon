@@ -11,7 +11,7 @@ class ScreenMatcher:
     잘라낸 모니터 화면이 우리가 찾는 1번(혹은 2번) 타겟 화면과 동일한지 
     '제로샷(1장만으로 비교)' 방식으로 판별하는 핵심 ORB 특징점 매칭 모듈입니다.
     """
-    def __init__(self, orb_nfeatures=700, lowe_ratio=0.75, match_threshold=25):
+    def __init__(self, orb_nfeatures=1200, lowe_ratio=0.75, match_threshold=25):
         # 1. ORB (특징점 추출기)
         # 딥러닝과 달리 규칙 기반으로 빠르고 가볍게 이미지의 특징점(코너 등) 700개를 찾습니다.
         # 문서 검증 지표인 65ms 속도 제한을 맞추기 위한 극단적 경량화 세팅입니다.
