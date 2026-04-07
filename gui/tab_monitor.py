@@ -25,7 +25,8 @@ C_RED    = "#E74C3C"; C_ORANGE = "#E67E22"; C_BORDER = "#E0E4E8"
 C_YELLOW = "#F39C12"
 
 MATCH_THRESHOLD    = 60
-PENDING_THRESHOLD  = 70   # 이 점수 미만이면 pending 폴더에 원본 자동 저장
+# NOTE: pending 저장은 MATCH_THRESHOLD 기준 ±margin(2~3점) 방식으로 동작합니다.
+# (tab_monitor.py:1194 참고) PENDING_THRESHOLD는 더 이상 사용되지 않습니다.
 
 # 설정 파일에서 임계값 덮어쓰기 (파일이 없으면 위 기본값 유지)
 try:
@@ -35,8 +36,7 @@ try:
     if os.path.isfile(_cfg_path):
         with open(_cfg_path, "r", encoding="utf-8") as _f:
             _saved = _json.load(_f)
-        MATCH_THRESHOLD   = int(_saved.get("MATCH_THRESHOLD",   MATCH_THRESHOLD))
-        PENDING_THRESHOLD = int(_saved.get("PENDING_THRESHOLD", PENDING_THRESHOLD))
+        MATCH_THRESHOLD = int(_saved.get("MATCH_THRESHOLD", MATCH_THRESHOLD))
 except Exception:
     pass
 
@@ -49,7 +49,8 @@ def _load_params_config() -> dict:
     defaults = {
         "nfeatures": 700, "lowe_ratio": 0.75, "match_threshold": 25,
         "roi_match_threshold": 7, "clahe_clip_limit": 2.0, "clahe_tile_grid": 8,
-        "MATCH_THRESHOLD": 60, "PENDING_THRESHOLD": 70,
+        "MATCH_THRESHOLD": 60,
+        "blur_ksize": 0, "gamma": 1.0, "sharpen_amount": 1.0,
     }
     if os.path.isfile(PARAMS_CONFIG_FILE):
         try:
@@ -100,7 +101,7 @@ class LatencyBarWidget(QWidget):
             h.addWidget(l); h.addWidget(b); h.addWidget(val)
             return h, b, val
         r1,self.b_yolo,self.v_yolo = _row("YOLO 추론", C_BLUE)
-        r2,self.b_pre, self.v_pre  = _row("5단계 전처리", C_YELLOW)
+        r2,self.b_pre, self.v_pre  = _row("전처리 (최대5단계)", C_YELLOW)
         r3,self.b_ext, self.v_ext  = _row("ORB 고유추출", "#9B59B6")
         r4,self.b_cmp, self.v_cmp  = _row("타겟 병렬비교", C_ORANGE)
         v.addLayout(r1); v.addLayout(r2); v.addLayout(r3); v.addLayout(r4)
@@ -118,7 +119,7 @@ class LatencyBarWidget(QWidget):
 
 class PieChartWidget(QWidget):
     def __init__(self):
-        super().__init__(); self.setFixedHeight(140)
+        super().__init__(); self.setFixedHeight(160)
         self._cum = [0.0, 0.0, 0.0, 0.0]
         self._vals = [0.0, 0.0, 0.0, 0.0]
         self._colors = [C_BLUE, C_YELLOW, "#9B59B6", C_ORANGE]
@@ -134,26 +135,42 @@ class PieChartWidget(QWidget):
         self._cum[3] += max(0.1, c)
         self._vals = self._cum.copy()
         self.update()
+
     def paintEvent(self, e):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
         p.setBrush(QBrush(QColor(C_WHITE))); p.setPen(QPen(QColor(C_BORDER)))
-        p.drawRoundedRect(0,0,w,h,6,6)
+        p.drawRoundedRect(0, 0, w, h, 6, 6)
         tot = sum(self._vals)
-        if tot <= 0: tot = 0.0001  # 0 나누기 방지
+        if tot <= 0: tot = 0.0001
+
+        # 제목
+        p.setPen(QPen(QColor(C_DARK))); p.setFont(QFont("Malgun Gothic", 10, QFont.Bold))
+        p.drawText(QRect(0, 4, w, 20), Qt.AlignCenter, "비중 원그래프 (Pie Chart)")
+
+        # 파이 차트 (중앙 상단)
+        cx, cy, r = w // 2, 65, 38
         start = 0
-        cx, cy, r = w//4, h//2+5, 40
         for i, val in enumerate(self._vals):
-            span = int(-val/tot * 5760); p.setBrush(QBrush(QColor(self._colors[i]))); p.setPen(Qt.NoPen)
-            p.drawPie(cx-r, cy-r, r*2, r*2, start, span)
+            span = int(-val / tot * 5760)
+            p.setBrush(QBrush(QColor(self._colors[i]))); p.setPen(Qt.NoPen)
+            p.drawPie(cx - r, cy - r, r * 2, r * 2, start, span)
             start += span
-        p.setPen(QPen(QColor(C_DARK))); p.setFont(QFont("Malgun Gothic",10,QFont.Bold))
-        p.drawText(QRect(0,0,w,20), Qt.AlignCenter, "비중 원그래프 (Pie Chart)")
-        bx, by = w//2 + 20, 30
-        p.setFont(QFont("Malgun Gothic",9))
+
+        # 범례 — 차트 아래 2열 배치 (잘림 방지)
+        p.setFont(QFont("Malgun Gothic", 9))
+        legend_y = cy + r + 8
+        cols = [10, w // 2 + 5]
         for i, val in enumerate(self._vals):
-            p.setBrush(QBrush(QColor(self._colors[i]))); p.drawRect(bx, by+i*20, 10, 10)
-            p.drawText(bx+18, by+i*20+10, f"{self._names[i]}: {val/tot*100:.1f}%")
+            col = i % 2
+            lx = cols[col]
+            ly = legend_y + (i // 2) * 18
+            p.setBrush(QBrush(QColor(self._colors[i])))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(lx, ly, 9, 9, 2, 2)
+            p.setPen(QPen(QColor(C_DARK)))
+            p.drawText(lx + 13, ly + 9, f"{self._names[i]}: {val/tot*100:.1f}%")
+
 
 class BoxPlotWidget(QWidget):
     def __init__(self, title="ORB 점수 분포 (Box Plot)", max_val=100, is_time=False):
@@ -539,10 +556,18 @@ class ORBViewer(QLabel):
         if img_color is None:
             return
 
-        # ⚠️ 실제 파이프라인과 동일하게 전처리 계층(CLAHE+Sharpen) 적용
+        # ⚠️ 실제 파이프라인과 동일하게 전처리 계층 적용 (설정값 반영)
         try:
             from engine.preprocessor import ImagePreprocessor
-            pre_ready = ImagePreprocessor().preprocess_for_orb(img_color)
+            _cfg = _load_params_config()
+            _tile = int(_cfg.get("clahe_tile_grid", 8))
+            pre_ready = ImagePreprocessor(
+                clahe_clip_limit=float(_cfg.get("clahe_clip_limit", 2.0)),
+                clahe_tile_grid=(_tile, _tile),
+                blur_ksize=int(_cfg.get("blur_ksize", 0)),
+                gamma=float(_cfg.get("gamma", 1.0)),
+                sharpen_amount=float(_cfg.get("sharpen_amount", 1.0)),
+            ).preprocess_for_orb(img_color)
         except Exception as ex:
             print(f"전처리 모듈 로드 실패, 흑백 변환으로 대체: {ex}")
             pre_ready = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
@@ -734,8 +759,8 @@ class TargetROITab(QWidget):
 
     def _load_target_list(self):
         self.img_list.clear()
-        # 타겟 이미지 경로: dataset_target_and_1cycle/target_image
-        td = os.path.join(_ROOT, "dataset_target_and_1cycle", "target_image")
+        # 타겟 이미지 경로: data/targets
+        td = os.path.join(_ROOT, "data", "targets")
         print(f"[TargetROITab] 타겟 경로: {td} | 존재: {os.path.isdir(td)}")
         if not os.path.isdir(td):
             print(f"[TargetROITab] ⚠️ 경로 없음: {td}")
@@ -753,7 +778,7 @@ class TargetROITab(QWidget):
 
     def _load_image(self, fname):
         if not fname: return
-        path = os.path.join(_ROOT, "dataset_target_and_1cycle", "target_image", fname)
+        path = os.path.join(_ROOT, "data", "targets", fname)
         self._cur_fname = fname
         self._rois  = self._roi_dict.get(fname, []).copy()
         self._masks = self._mask_dict.get(fname, []).copy()
@@ -923,6 +948,7 @@ class VideoThread(QThread):
         self._last_crop          = None   # 최근 YOLO 크롭 프레임 (BGR 640×360)
         self._last_best_target_id = ''    # 최근 매칭된 타겟 ID (스킵 프레임에서도 유지)
         self._last_display_frame  = None  # ROI 오버레이가 그려진 최근 분석 프레임
+        self.show_crop            = False # True: YOLO 크롭 뷰, False: 풀프레임 뷰
 
     def pause_resume(self):
         self._paused = not self._paused
@@ -940,6 +966,9 @@ class VideoThread(QThread):
             self.preprocessor = ImagePreprocessor(
                 clahe_clip_limit=float(_cfg["clahe_clip_limit"]),
                 clahe_tile_grid=(tile, tile),
+                blur_ksize=int(_cfg.get("blur_ksize", 0)),
+                gamma=float(_cfg.get("gamma", 1.0)),
+                sharpen_amount=float(_cfg.get("sharpen_amount", 1.0)),
             )
             self.matcher = ScreenMatcher(
                 orb_nfeatures=int(_cfg["nfeatures"]),
@@ -984,7 +1013,7 @@ class VideoThread(QThread):
         # YOLO 초기화 이후 타겟 로드 — detector를 넘겨 타겟 이미지에도 YOLO 크롭 적용
         if self.matcher:
             try:
-                td = os.path.join(_ROOT, "dataset_target_and_1cycle", "target_image")
+                td = os.path.join(_ROOT, "data", "targets")
                 mask_cfg = os.path.join(_ROOT, "data", "mask_config.json")
                 self.targets = self.matcher.load_targets_from_dir(
                     td, ROI_SAVE_FILE, detector=self.detector,
@@ -1074,50 +1103,53 @@ class VideoThread(QThread):
                                         live_roi_features[key] = None
                     orb_ext_ms = (time.perf_counter()-t2)*1000
 
-                    # ③-B 타겟 병렬비교: 추출된 특징점 vs 타겟 ROI 디스크립터
+                    # ③-B 타겟 병렬비교: 추출된 특징점 vs 타겟 ROI 디스크립터 (멀티스레딩 최적화)
                     t3 = time.perf_counter()
                     best_score = 0; best_passed = 0; best_total = 0; best_ok = False
                     best_target_id = ''
                     frame_roi_detail = []   # 진단 DB 기록용
 
-                    for target_id, target_data in self.targets.items():
-                        rois   = target_data.get('rois', [])
-                        n_rois = target_data.get('n_rois', 0)
+                    if not hasattr(self, '_target_executor'):
+                        import concurrent.futures
+                        self._target_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
+                    def _compare_single_target(target_item):
+                        tid, t_data = target_item
+                        rois   = t_data.get('rois', [])
+                        n_rois = t_data.get('n_rois', 0)
+                        
+                        l_detail = []
                         if n_rois == 0:
                             # ROI 미설정 → 전체 이미지 fallback
-                            s, p = self.matcher.compare_descriptors(
-                                full_des_cache, target_data.get('full'))
-                            if s > best_score or p:
-                                best_score = max(best_score, s)
-                                best_passed = 1 if p else 0
-                                best_total  = 1
-                                best_ok     = p
-                                best_target_id = target_id
-                            continue
+                            s, p = self.matcher.compare_descriptors(full_des_cache, t_data.get('full'))
+                            return tid, 1, s, (1 if p else 0), p, l_detail
 
-                        passed = 0; max_s = 0
+                        l_passed = 0; max_s = 0
                         for roi_idx, (t_des, rx1, ry1, rx2, ry2) in enumerate(rois):
                             q_des = live_roi_features.get((rx1, ry1, rx2, ry2))
                             s, p = self.matcher.compare_descriptors(
                                 q_des, t_des, threshold=ROI_MATCH_THRESHOLD)
                             if s > max_s: max_s = s
-                            if p: passed += 1
-                            frame_roi_detail.append(
-                                    (target_id, roi_idx, rx1, ry1, rx2, ry2, s, p))
+                            if p: l_passed += 1
+                            l_detail.append((tid, roi_idx, rx1, ry1, rx2, ry2, s, p))
 
-                        # 합격 조건:
-                        #   ROI 1개 → 1/1 필요
-                        #   ROI 2개 → 2/2 필요 (1개짜리 ROI가 다른 타겟과 겹칠 수 있으므로 전부 통과)
-                        #   ROI 3개 이상 → 최대 1개 실패 허용
                         required  = n_rois if n_rois <= 2 else n_rois - 1
-                        target_ok = passed >= required
-                        if target_ok or max_s > best_score:
-                            best_score  = max_s
-                            best_passed = passed
-                            best_total  = n_rois
-                            best_ok     = target_ok
-                            best_target_id = target_id
+                        tok = l_passed >= required
+                        return tid, n_rois, max_s, l_passed, tok, l_detail
+
+                    if self.targets:
+                        import concurrent.futures
+                        futures = [self._target_executor.submit(_compare_single_target, item) 
+                                   for item in self.targets.items()]
+                        for future in concurrent.futures.as_completed(futures):
+                            tid, n_tot, cur_max_s, passed, tok, l_detail = future.result()
+                            frame_roi_detail.extend(l_detail)
+                            if tok or cur_max_s > best_score:
+                                best_score  = cur_max_s
+                                best_passed = passed
+                                best_total  = n_tot
+                                best_ok     = tok
+                                best_target_id = tid
 
                     score      = best_score
                     roi_passed = best_passed
@@ -1164,13 +1196,21 @@ class VideoThread(QThread):
 
                     # ④ 합격 전환 시점에만 matched 캡처
                     if is_ok and not self._last_is_ok:
-                        mfname = f"matched_{idx:06d}_{roi_passed}of{roi_total}.jpg"
+                        from datetime import datetime as _dt
+                        _ts = _dt.now().strftime("%Y%m%d_%H%M%S_%f")[:18]
+                        mfname = f"matched_{_ts}_{roi_passed}of{roi_total}.jpg"
                         cv2.imwrite(os.path.join(self.matched_dir, mfname), frame)
                         self.capture_signal.emit(mfname)
 
-                    # ⑤ 미매칭 → pending 캡처
-                    if not is_ok:
-                        pfname = f"pending_{idx:06d}_s{score}.jpg"
+                    # ⑤ 애매한 점수대(Hard Mining) → pending 캡처
+                    # 의미 없는(너무 낮은) 점수는 버리고, 커트라인 근접 데이터만 수집
+                    margin = 2 if roi_total > 0 else 3
+                    target_thr = ROI_MATCH_THRESHOLD if roi_total > 0 else MATCH_THRESHOLD
+
+                    if abs(score - target_thr) <= margin:
+                        from datetime import datetime as _dt
+                        _ts = _dt.now().strftime("%Y%m%d_%H%M%S_%f")[:18]
+                        pfname = f"pending_{_ts}_s{score:02d}.jpg"
                         cv2.imwrite(os.path.join(self.pending_dir, pfname), frame)
 
                     if self.skipper:
@@ -1212,8 +1252,11 @@ class VideoThread(QThread):
                     cv2.putText(frame, label, (lx, ly),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
 
-            # 항상 원본 풀프레임을 표시 (YOLO 박스/폴리곤 오버레이 포함됨)
-            disp     = frame
+            # 풀프레임 뷰 OR YOLO 크롭 뷰 선택 (버튼 토글)
+            if self.show_crop and self._last_display_frame is not None:
+                disp = self._last_display_frame  # YOLO 크롭 + ROI 오버레이 뷰
+            else:
+                disp = frame                     # 원본 풀프레임 뷰
             rgb      = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
             h, w, _  = rgb.shape
             self.frame_signal.emit(QImage(rgb.data, w, h, 3*w, QImage.Format_RGB888).copy())
@@ -1258,12 +1301,17 @@ class VideoThread(QThread):
         self.use_clahe = enabled
         print(f"[VideoThread] CLAHE {'ON' if enabled else 'OFF'}")
 
+    def set_show_crop(self, enabled: bool):
+        """뷰 모드 전환 — True: YOLO 크롭 뷰, False: 풀프레임 뷰 (런닝 중 즉시 적용)"""
+        self.show_crop = enabled
+        print(f"[VideoThread] 뷰 모드: {'크롭 뷰' if enabled else '풀프레임 뷰'}")
+
     def reload_targets(self):
         """타겟 이미지 교체 후 ORB 특징점을 즉시 재로드"""
         if self.matcher is None:
             return
         try:
-            td = os.path.join(_ROOT, "dataset_target_and_1cycle", "target_image")
+            td = os.path.join(_ROOT, "data", "targets")
             self.targets = self.matcher.load_targets_from_dir(
                 td, ROI_SAVE_FILE, detector=self.detector)
             print(f"[VideoThread] 타겟 재로드 완료: {list(self.targets.keys())}")
@@ -1437,95 +1485,133 @@ class LiveMonitorSubTab(QWidget):
         v.addLayout(body, stretch=1)
 
     def _build_ctrl(self):
-        bar = QWidget(); bar.setFixedHeight(46)
-        bar.setStyleSheet(f"background:{C_WHITE}; border:1px solid {C_BORDER}; border-radius:8px;")
-        h = QHBoxLayout(bar); h.setContentsMargins(10,0,10,0); h.setSpacing(8)
-        h.addWidget(QLabel("🎥  실시간 관제"))
-        h.addStretch()
-        for text, slot in [("📂  파일 열기", self._open_file), ("📷  카메라 (0번)", self._open_cam)]:
-            b = QPushButton(text); b.clicked.connect(slot); h.addWidget(b)
-            
-        # ── 재생/일시정지 버튼 ───────────────────────────
-        self.btn_pause = QPushButton("⏸ 일시 정지")
-        self.btn_pause.setStyleSheet(f"background:{C_ORANGE};color:white;border:none;border-radius:6px;font-weight:bold;")
+        # ── 공통 버튼 스타일 헬퍼 ─────────────────────────────────────
+        def _btn(text, color=None, checkable=False, checked=False):
+            b = QPushButton(text)
+            b.setMinimumWidth(72)
+            b.setFixedHeight(28)
+            b.setCheckable(checkable)
+            b.setChecked(checked)
+            if checkable:
+                b.setStyleSheet(
+                    f"QPushButton{{background:{C_BG};color:{C_DARK};"
+                    f"border:1px solid {C_BORDER};border-radius:5px;"
+                    f"font-size:12px;font-weight:500;padding:0 8px;}}"
+                    f"QPushButton:checked{{background:{color if color else C_BLUE};"
+                    f"color:white;border:none;border-radius:5px;"
+                    f"font-size:12px;font-weight:bold;padding:0 8px;}}"
+                )
+            else:
+                bg = color if color else C_BG
+                fg = 'white' if color else C_DARK
+                bd = 'none' if color else f'1px solid {C_BORDER}'
+                b.setStyleSheet(
+                    f"QPushButton{{background:{bg};color:{fg};"
+                    f"border:{bd};border-radius:5px;"
+                    f"font-size:12px;font-weight:bold;padding:0 8px;}}"
+                )
+            return b
+
+        def _sep():
+            f = QFrame(); f.setFrameShape(QFrame.VLine)
+            f.setStyleSheet(f"color:{C_BORDER}; max-width:1px; margin:2px 2px;")
+            return f
+
+        # ── 외부 컨테이너 (2줄) ──────────────────────────────────────
+        bar = QWidget()
+        bar.setFixedHeight(86)
+        bar.setStyleSheet(
+            f"background:{C_WHITE}; border:1px solid {C_BORDER}; border-radius:8px;"
+        )
+        vbox = QVBoxLayout(bar)
+        vbox.setContentsMargins(10, 5, 10, 5)
+        vbox.setSpacing(4)
+
+        # ══ 상단 줄: 제목 | 소스 선택 | 재생 제어 | 상태 ══
+        top = QHBoxLayout(); top.setSpacing(6)
+
+        lbl_title = QLabel("실시간 관제")
+        lbl_title.setStyleSheet(
+            f"font-size:13px; font-weight:bold; color:{C_DARK}; padding-right:2px;"
+        )
+        top.addWidget(lbl_title)
+        top.addWidget(_sep())
+
+        btn_file = _btn("파일 열기", color=C_BLUE)
+        btn_file.clicked.connect(self._open_file)
+        btn_cam  = _btn("카메라 (0번)", color=C_BLUE)
+        btn_cam.clicked.connect(self._open_cam)
+        top.addWidget(btn_file)
+        top.addWidget(btn_cam)
+        top.addWidget(_sep())
+
+        self.btn_pause = _btn("일시 정지", color=C_ORANGE)
         self.btn_pause.clicked.connect(self._toggle_pause)
         self.btn_pause.setEnabled(False)
-        h.addWidget(self.btn_pause)
-        
-        btn_stop = QPushButton("⏹ 종료")
-        btn_stop.setStyleSheet(f"background:{C_RED};color:white;border:none;border-radius:6px;font-weight:bold;")
-        btn_stop.clicked.connect(self._stop); h.addWidget(btn_stop)
-
-        # ── 프레임 스킵 토글 버튼 ───────────────────────────
-        self.btn_skip = QPushButton("⚡ 스킵 ON")
-        self.btn_skip.setCheckable(True)
-        self.btn_skip.setChecked(True)
-        self.btn_skip.setFixedWidth(80)
-        self.btn_skip.setStyleSheet(
-            f"QPushButton{{background:{C_BLUE};color:white;border:none;border-radius:6px;font-weight:bold;font-size:11px;}}"
-            f"QPushButton:!checked{{background:{C_BG};color:{C_DARK};border:1px solid {C_BORDER};}}")
-        self.btn_skip.clicked.connect(self._toggle_skip)
-        h.addWidget(self.btn_skip)
-
-        # ── 진단 ON/OFF ───────────────────────────────────
-        self.btn_diag = QPushButton("🔬 진단 OFF")
-        self.btn_diag.setCheckable(True)
-        self.btn_diag.setChecked(False)
-        self.btn_diag.setFixedWidth(90)
-        self.btn_diag.setStyleSheet(
-            f"QPushButton{{background:{C_BG};color:{C_DARK};border:1px solid {C_BORDER};border-radius:6px;font-size:11px;}}"
-            f"QPushButton:checked{{background:#8E44AD;color:white;border:none;border-radius:6px;font-size:11px;font-weight:bold;}}")
-        self.btn_diag.clicked.connect(self._toggle_diag)
-        h.addWidget(self.btn_diag)
-
-        # ── CLAHE ON/OFF ──────────────────────────────────
-        self.btn_clahe = QPushButton("CLAHE ON")
-        self.btn_clahe.setCheckable(True)
-        self.btn_clahe.setChecked(True)
-        self.btn_clahe.setFixedWidth(90)
-        self.btn_clahe.setStyleSheet(
-            f"QPushButton:checked{{background:{C_YELLOW};color:white;border:none;border-radius:6px;font-size:11px;font-weight:bold;}}"
-            f"QPushButton:!checked{{background:{C_BG};color:{C_DARK};border:1px solid {C_BORDER};border-radius:6px;font-size:11px;}}")
-        self.btn_clahe.clicked.connect(self._toggle_clahe)
-        h.addWidget(self.btn_clahe)
-
-        # ── DB 초기화 ─────────────────────────────────────
-        btn_db_clr = QPushButton("🗑 DB 초기화")
-        btn_db_clr.setFixedWidth(90)
-        btn_db_clr.setStyleSheet(
-            f"background:{C_BG};color:{C_DARK};border:1px solid {C_BORDER};border-radius:6px;font-size:11px;")
-        btn_db_clr.clicked.connect(self._clear_diag_db)
-        h.addWidget(btn_db_clr)
-
-        # ── GT 캡처 (정답 라벨링용) ───────────────────────
-        btn_gt_cap = QPushButton("🖼 GT 캡처")
-        btn_gt_cap.setFixedWidth(90)
-        btn_gt_cap.setStyleSheet(
-            f"background:#9B59B6;color:white;border:none;border-radius:6px;font-size:11px;font-weight:bold;")
-        btn_gt_cap.clicked.connect(self._capture_for_gt)
-        h.addWidget(btn_gt_cap)
-
-        # ── 타겟 저장 ─────────────────────────────────────
-        btn_save_target = QPushButton("📸 타겟 저장")
-        btn_save_target.setFixedWidth(95)
-        btn_save_target.setStyleSheet(
-            f"background:{C_GREEN};color:white;border:none;border-radius:6px;font-size:11px;font-weight:bold;")
-        btn_save_target.clicked.connect(self._save_as_target)
-        h.addWidget(btn_save_target)
+        btn_stop = _btn("종료", color=C_RED)
+        btn_stop.clicked.connect(self._stop)
+        top.addWidget(self.btn_pause)
+        top.addWidget(btn_stop)
+        top.addStretch()
 
         self.lbl_st = QLabel("● 대기")
-        self.lbl_st.setStyleSheet(f"font-size:12px; font-weight:bold; color:{C_SUB}; padding-left:6px;")
-        h.addWidget(self.lbl_st)
+        self.lbl_st.setStyleSheet(
+            f"font-size:12px; font-weight:bold; color:{C_SUB};"
+        )
+        top.addWidget(self.lbl_st)
+
+        # ══ 하단 줄: 옵션 토글 | 데이터 액션 ══
+        bot = QHBoxLayout(); bot.setSpacing(6)
+
+        self.btn_skip = _btn("스킵 ON", color=C_BLUE, checkable=True, checked=True)
+        self.btn_skip.clicked.connect(self._toggle_skip)
+
+        self.btn_clahe = _btn("CLAHE", color=C_YELLOW, checkable=True, checked=True)
+        self.btn_clahe.clicked.connect(self._toggle_clahe)
+
+        self.btn_crop_view = _btn("크롭 뷰", color="#E67E22", checkable=True, checked=False)
+        self.btn_crop_view.clicked.connect(self._toggle_crop_view)
+
+        self.btn_diag = _btn("진단", color="#8E44AD", checkable=True, checked=False)
+        self.btn_diag.clicked.connect(self._toggle_diag)
+
+        bot.addWidget(self.btn_skip)
+        bot.addWidget(self.btn_clahe)
+        bot.addWidget(self.btn_crop_view)
+        bot.addWidget(self.btn_diag)
+        bot.addWidget(_sep())
+
+        btn_db_clr = _btn("DB 초기화")
+        btn_db_clr.clicked.connect(self._clear_diag_db)
+
+        btn_gt_cap = _btn("GT 캡처", color="#9B59B6")
+        btn_gt_cap.clicked.connect(self._capture_for_gt)
+
+        btn_save_target = _btn("타겟 저장", color=C_GREEN)
+        btn_save_target.clicked.connect(self._save_as_target)
+
+        bot.addWidget(btn_db_clr)
+        bot.addWidget(btn_gt_cap)
+        bot.addWidget(btn_save_target)
+        bot.addStretch()
+
+        vbox.addLayout(top)
+        vbox.addLayout(bot)
+
+
         return bar
+
+
+
 
     def _toggle_skip(self):
         checked = self.btn_skip.isChecked()
         if self._thread: self._thread.set_skip_enabled(checked)
-        self.btn_skip.setText("⚡ 스킵 ON" if checked else "⚡ 스킵 OFF")
+        self.btn_skip.setText("스킵 ON" if checked else "스킵 OFF")
 
     def _toggle_diag(self):
         checked = self.btn_diag.isChecked()
-        self.btn_diag.setText("🔬 진단 ON" if checked else "🔬 진단 OFF")
+        self.btn_diag.setText("진단 ON" if checked else "진단")
         if self._thread:
             self._thread.set_diag(checked)
 
@@ -1534,6 +1620,13 @@ class LiveMonitorSubTab(QWidget):
         self.btn_clahe.setText("CLAHE ON" if checked else "CLAHE OFF")
         if self._thread:
             self._thread.set_clahe(checked)
+
+    def _toggle_crop_view(self):
+        """✂ 크롭 뷰 토글 — YOLO 크롭 분석 화면과 원본 풀프레임 화면을 전환"""
+        checked = self.btn_crop_view.isChecked()
+        self.btn_crop_view.setText("크롭 ON" if checked else "크롭 뷰")
+        if self._thread:
+            self._thread.set_show_crop(checked)
 
     def _clear_diag_db(self):
         if self._thread and self._thread._diag_logger:
@@ -1582,7 +1675,7 @@ class LiveMonitorSubTab(QWidget):
         if not ok:
             return
 
-        td = os.path.join(_ROOT, "dataset_target_and_1cycle", "target_image")
+        td = os.path.join(_ROOT, "data", "targets")
         os.makedirs(td, exist_ok=True)
         save_path = os.path.join(td, f"{n}.png")
 
@@ -1685,8 +1778,659 @@ class LiveMonitorSubTab(QWidget):
     def closeEvent(self, e): self._stop(); super().closeEvent(e)
 
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  최종 MonitorTab (서브탭 A + 서브탭 B)
+#  샴 네트워크 VideoThread
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class SiameseVideoThread(QThread):
+    """
+    샴 네트워크(ResNet18 임베딩 + 코사인 유사도)로 화면을 분류하는 스레드.
+
+    use_yolo=True  → YOLO로 모니터 영역 크롭 후 임베딩 (정확도 ↑)
+    use_yolo=False → 풀프레임을 그대로 임베딩 (YOLO 없이도 작동 확인)
+    """
+    # QImage 프레임
+    frame_signal  = pyqtSignal(QImage)
+    # fps, yolo_ms, embed_ms, sim_ms, similarity(0~100), is_ok, target_id
+    status_signal = pyqtSignal(float, float, float, float, float, bool, str)
+    progress_signal = pyqtSignal(int, int)
+
+    def __init__(self, source, use_yolo: bool = True):
+        super().__init__()
+        self.source   = source
+        self.use_yolo = use_yolo
+        self.running  = True
+        self._paused  = False
+        self._seek_frame = -1
+        self._fps_ts  = deque(maxlen=7)
+
+        # 합격 임계값: siamese_classifier.py의 cosine_threshold(기본 0.75)로 위임됨.
+        # 이 값은 GUI에서 슬라이더로 변경할 경우 classifier.cosine_threshold에 반영.
+        self.sim_threshold = 0.75
+
+        self.detector   = None
+        self.classifier = None
+        self._last_crop = None
+
+    # ── 외부 제어 ──────────────────────────────────────────
+    def pause_resume(self):
+        self._paused = not self._paused
+
+    def set_frame(self, frame_idx: int):
+        self._seek_frame = frame_idx
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+    def set_use_yolo(self, enabled: bool):
+        self.use_yolo = enabled
+
+    def set_sim_threshold(self, val: float):
+        self.sim_threshold = val
+        # classifier가 초기화된 상태라면 cosine_threshold도 동기화
+        if self.classifier is not None:
+            self.classifier.cosine_threshold = val
+
+    # ── 메인 루프 ──────────────────────────────────────────
+    def run(self):
+        # 1. 샴 분류기 초기화
+        try:
+            from offline.siamese_classifier import SiameseClassifier
+            self.classifier = SiameseClassifier()
+            print("[SiameseThread] 샴 분류기 초기화 완료")
+        except Exception as e:
+            print(f"[SiameseThread] 샴 분류기 초기화 실패: {e}")
+            return
+
+        # 2. YOLO 탐지기 초기화 (use_yolo=True 일 때만)
+        if self.use_yolo:
+            try:
+                from engine.detector import BezelDetector
+                active_file = os.path.join(_ROOT, "data", "active_model.json")
+                model_path  = None
+                if os.path.exists(active_file):
+                    try:
+                        import json as _j
+                        with open(active_file) as af:
+                            model_path = os.path.join(_ROOT, _j.load(af).get("path", ""))
+                    except Exception:
+                        pass
+                if not model_path or not os.path.exists(model_path):
+                    seg_best  = os.path.join(_ROOT, "models", "canon_fast_yolo", "weights", "best.pt")
+                    det_model = os.path.join(_ROOT, "yolov8n.pt")
+                    model_path = seg_best if os.path.exists(seg_best) else (
+                        det_model if os.path.exists(det_model) else None)
+                if model_path:
+                    self.detector = BezelDetector(model_path=model_path)
+                    print(f"[SiameseThread] YOLO 로드 완료: {os.path.basename(model_path)}")
+                else:
+                    print("[SiameseThread] ⚠️  YOLO 모델 파일 없음 → 폴백: 풀프레임")
+            except Exception as e:
+                print(f"[SiameseThread] YOLO 초기화 실패 → 풀프레임 폴백: {e}")
+
+        # 3. 영상 열기
+        from PIL import Image as PILImage
+        cap = cv2.VideoCapture(self.source)
+        if not cap.isOpened():
+            return
+
+        tot_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if tot_frames <= 0:
+            tot_frames = 1
+        idx = 0
+
+        while self.running:
+            if self._seek_frame >= 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, self._seek_frame)
+                self._seek_frame = -1
+
+            if self._paused:
+                self.msleep(50)
+                continue
+
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+
+            cur_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            self.progress_signal.emit(cur_frame, tot_frames)
+
+            yolo_ms = embed_ms = sim_ms = 0.0
+            similarity = 0.0
+            is_ok = False
+            target_id = ""
+            display_frame = frame.copy()
+            active_bbox = None
+
+            # ① YOLO 크롭 (use_yolo=True이고 detector 있을 때만)
+            analysis_frame = frame.copy()
+            if self.use_yolo and self.detector:
+                t0 = time.perf_counter()
+                cropped, bbox = self.detector.detect_and_crop(frame)
+                yolo_ms = (time.perf_counter() - t0) * 1000
+                if cropped is not None and cropped.size > 0:
+                    analysis_frame = cropped
+                    active_bbox = bbox
+            
+            # 저장용 크롭 기억
+            self._last_crop = analysis_frame.copy()
+
+            # ② & ③ 임베딩 추출 및 분류 (FC 우선, 코사인 폴백)
+            t1 = time.perf_counter()
+            try:
+                # BGR → RGB → PIL
+                rgb_img = cv2.cvtColor(analysis_frame, cv2.COLOR_BGR2RGB)
+                pil_img = PILImage.fromarray(rgb_img)
+                best_name, confidence, ok_flag = self.classifier.classify_frame(pil_img)
+                
+                if best_name:
+                    similarity = confidence
+                    target_id  = os.path.splitext(best_name)[0]
+                    is_ok      = ok_flag
+            except Exception as e:
+                print(f"[SiameseThread] 분류 실패: {e}")
+            
+            # 이전 구조와의 UI 호환성을 위해 연산 시간을 임의 반분 (통합되었으므로)
+            total_t  = (time.perf_counter() - t1) * 1000
+            embed_ms = total_t * 0.7
+            sim_ms   = total_t * 0.3
+
+            # ④ 오버레이 — analysis_frame에 결과 표시
+            ov_color = (0, 200, 0) if is_ok else (0, 60, 220)
+            sim_pct  = f"{similarity:.1f}%"
+            cv2.rectangle(analysis_frame, (0, 0), (340, 26), (0, 0, 0), -1)
+            cv2.putText(analysis_frame,
+                        f"Siamese | Target:{target_id}  Sim:{sim_pct}",
+                        (4, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, ov_color, 1, cv2.LINE_AA)
+
+            # ⑤ 원본 프레임에 YOLO 박스 오버레이 (use_yolo 모드일 때)
+            if active_bbox:
+                x1, y1, x2, y2 = active_bbox
+                corners = self.detector.last_corners if self.detector else None
+                if corners is not None:
+                    pts = corners.astype(np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(display_frame, [pts], True, (0, 255, 0), 3)
+                else:
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 200, 255), 3)
+
+            # ⑥ 화면 미리보기: analysis 결과를 display_frame 좌상단 인셋으로 합성
+            ih, iw = analysis_frame.shape[:2]
+            th = min(200, display_frame.shape[0] // 3)
+            tw = int(th * iw / ih)
+            inset = cv2.resize(analysis_frame, (tw, th))
+            dh, dw = display_frame.shape[:2]
+            if dh >= th and dw >= tw:
+                display_frame[0:th, 0:tw] = inset
+                cv2.rectangle(display_frame, (0, 0), (tw, th), (0, 180, 255), 2)
+
+            # ⑦ 프레임 emit
+            rgb_disp = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+            h, w, _ = rgb_disp.shape
+            self.frame_signal.emit(
+                QImage(rgb_disp.data, w, h, 3 * w, QImage.Format_RGB888).copy())
+
+            # ⑧ FPS 계산 & status emit
+            curr_t = time.perf_counter()
+            self._fps_ts.append(curr_t)
+            fps_real = ((len(self._fps_ts) - 1) /
+                        max(self._fps_ts[-1] - self._fps_ts[0], 1e-6)
+                        ) if len(self._fps_ts) >= 2 else 0.0
+
+            self.status_signal.emit(
+                fps_real, yolo_ms, embed_ms, sim_ms, similarity, is_ok, target_id)
+            idx += 1
+
+        cap.release()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  샴 네트워크 우측 통계 패널
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class SiameseStatsPanel(QWidget):
+    """YOLO+ORB StatsPanel과 동일한 구성, 샴 전용 지표 표시"""
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumWidth(300)
+        self.setMaximumWidth(380)
+        self.setStyleSheet(f"background:{C_WHITE}; border-left:1px solid {C_BORDER};")
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+
+        content = QWidget()
+        v = QVBoxLayout(content)
+        v.setContentsMargins(14, 14, 14, 14)
+        v.setSpacing(12)
+
+        def sep():
+            f = QFrame()
+            f.setFrameShape(QFrame.HLine)
+            f.setStyleSheet(f"color:{C_BORDER}; max-height:1px;")
+            return f
+
+        # ── KPI 카드 (1행) ────────────────────────────────────────
+        # 🧠 핵심 지표: FPS / 유사도 % / 판정 / YOLO
+        row = QHBoxLayout()
+        self.fps_card   = self._card("FPS",       "--")
+        self.sim_card   = self._card("유사도 %",  "--")
+        self.verdict    = self._card("판정",      "대기")
+        self.yolo_card  = self._card("YOLO",      "미연결")
+        row.addWidget(self.fps_card[0])
+        row.addWidget(self.sim_card[0])
+        row.addWidget(self.verdict[0])
+        row.addWidget(self.yolo_card[0])
+        v.addLayout(row)
+
+        # ── KPI 카드 (2행) — 처리 시간 합계 ─────────────────────
+        self.lbl_total = QLabel("Total: 0 ms")
+        self.lbl_total.setStyleSheet(
+            f"font-size:15px; font-weight:bold; color:{C_DARK}; text-align:center;")
+        self.lbl_total.setAlignment(Qt.AlignCenter)
+        v.addWidget(self.lbl_total)
+        v.addWidget(sep())
+
+        # ── Latency 막대 (YOLO / 임베딩 추출 / 유사도 비교) ──────
+        self.latency = self._build_latency_bars(v)
+        v.addWidget(sep())
+
+        # ── 파이 차트 ─────────────────────────────────────────────
+        self.pie = PieChartWidget()
+        self.pie._names = ["YOLO", "임베딩", "유사도비교", ""]
+        v.addWidget(self.pie)
+        v.addWidget(sep())
+
+        # ── 전체 소요 시간 캔들스틱 ──────────────────────────────
+        self.candle_chart = CandlestickWidget()
+        v.addWidget(self.candle_chart)
+        v.addWidget(sep())
+
+        # ── 유사도 분포 박스플롯 (합격/불합격) ───────────────────
+        self.boxplot = DualBoxPlotWidget(
+            title="유사도 분포 비교 (합격/불합격)", max_val=100)
+        v.addWidget(self.boxplot)
+        v.addStretch()
+
+        scroll.setWidget(content)
+        main_layout.addWidget(scroll)
+
+    # ── Latency 막대 3개 구성 ─────────────────────────────────────
+    def _build_latency_bars(self, v):
+        """YOLO / 임베딩 / 유사도비교 막대를 만들어 v에 추가, 참조 dict 반환"""
+        bars = {}
+        container = QWidget()
+        container.setFixedHeight(120)
+        cv = QVBoxLayout(container)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(6)
+
+        lbl = QLabel("⏱️  구간별 분석 시간 (Latency)")
+        lbl.setStyleSheet(f"font-size:12px; font-weight:bold; color:{C_DARK};")
+        cv.addWidget(lbl)
+
+        specs = [
+            ("YOLO 추론",    C_BLUE,    "yolo"),
+            ("임베딩 추출",  "#9B59B6", "embed"),
+            ("유사도 비교",  C_ORANGE,  "sim"),
+        ]
+        for name, color, key in specs:
+            h = QHBoxLayout()
+            lbl_n = QLabel(name)
+            lbl_n.setMinimumWidth(78)
+            lbl_n.setStyleSheet(f"font-size:12px; color:{C_DARK}; font-weight:bold;")
+            bar = QProgressBar()
+            bar.setMaximum(100)
+            bar.setValue(0)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(12)
+            bar.setStyleSheet(
+                f"QProgressBar{{background:{C_BORDER};border-radius:4px;}}"
+                f"QProgressBar::chunk{{background:{color};border-radius:4px;}}")
+            val_lbl = QLabel("0 ms")
+            val_lbl.setFixedWidth(52)
+            val_lbl.setStyleSheet(
+                f"font-size:11px; color:{C_DARK}; font-weight:bold;")
+            h.addWidget(lbl_n)
+            h.addWidget(bar)
+            h.addWidget(val_lbl)
+            cv.addLayout(h)
+            bars[key] = (bar, val_lbl)
+
+        v.addWidget(container)
+        return bars
+
+    def _card(self, title, val):
+        c = QWidget()
+        c.setStyleSheet(f"background:{C_BG}; border-radius:8px;")
+        cv = QVBoxLayout(c)
+        cv.setContentsMargins(8, 8, 8, 8)
+        t = QLabel(title)
+        t.setAlignment(Qt.AlignCenter)
+        t.setStyleSheet(f"font-size:11px; color:{C_SUB}; font-weight:bold;")
+        lv = QLabel(val)
+        lv.setAlignment(Qt.AlignCenter)
+        lv.setStyleSheet(
+            f"font-size:17px; font-weight:bold; color:{C_DARK};")
+        cv.addWidget(t)
+        cv.addWidget(lv)
+        return c, lv
+
+    def update_stats(self, fps, yolo_ms, embed_ms, sim_ms,
+                     similarity, is_ok, target_id, use_yolo):
+        total = yolo_ms + embed_ms + sim_ms
+        col   = C_GREEN if is_ok else C_RED
+
+        # FPS
+        self.fps_card[1].setText(f"{fps:.0f}")
+
+        # 유사도 카드
+        self.sim_card[1].setText(f"{similarity:.1f}%")
+        self.sim_card[1].setStyleSheet(
+            f"font-size:16px; font-weight:bold; color:{col};")
+
+        # 판정 카드
+        if is_ok and target_id:
+            verdict_text = f"✅ 타겟 {target_id}"
+        elif is_ok:
+            verdict_text = "✅ 정상"
+        else:
+            verdict_text = "❌ 불일치"
+        self.verdict[1].setText(verdict_text)
+        self.verdict[1].setStyleSheet(
+            f"font-size:13px; font-weight:bold; color:{col};")
+
+        # YOLO 카드
+        if use_yolo:
+            yolo_state = f"{yolo_ms:.0f}ms" if yolo_ms > 0 else "탐지 실패"
+            yolo_color = C_BLUE if yolo_ms > 0 else C_ORANGE
+        else:
+            yolo_state  = "OFF (풀프레임)"
+            yolo_color  = C_SUB
+        self.yolo_card[1].setText(yolo_state)
+        self.yolo_card[1].setStyleSheet(
+            f"font-size:11px; font-weight:bold; color:{yolo_color};")
+
+        # Total
+        self.lbl_total.setText(f"Total: {total:.1f} ms")
+
+        # Latency 막대 업데이트
+        total_safe = max(total, 1.0)
+        for key, ms in [("yolo", yolo_ms), ("embed", embed_ms), ("sim", sim_ms)]:
+            bar, lbl_v = self.latency[key]
+            bar.setValue(int(ms / total_safe * 100))
+            lbl_v.setText(f"{ms:.1f} ms")
+
+        # 파이 차트 (4번째 슬롯은 0 으로 채움)
+        self.pie.update_pie(yolo_ms, embed_ms, sim_ms, 0.01)
+
+        # 캔들스틱
+        self.candle_chart.add_value(total)
+
+        # 박스플롯
+        self.boxplot.add_score(similarity, is_ok)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  샴 네트워크 실시간 관제 서브탭
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class SiameseMonitorSubTab(QWidget):
+    """
+    YOLO+ORB LiveMonitorSubTab과 동일한 UX,
+    YOLO 사용 여부를 실시간으로 토글할 수 있습니다.
+
+    ◎ YOLO ON  → 모니터 영역 크롭 후 임베딩 (정확도 ↑)
+    ◎ YOLO OFF → 풀프레임 그대로 임베딩   (지연 ↓, 크롭 없음)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet(f"background:{C_BG};")
+        self._thread   = None
+        self._use_yolo = True    # 기본값: YOLO 활성
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+        v.addWidget(self._build_ctrl())
+
+        body = QHBoxLayout()
+        body.setSpacing(0)
+
+        # 좌측: 영상 + 슬라이더
+        left_body = QVBoxLayout()
+        left_body.setContentsMargins(0, 0, 0, 0)
+        left_body.setSpacing(8)
+
+        self.video = VideoDisplayLabel()
+        left_body.addWidget(self.video, stretch=1)
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 100)
+        self.slider.setEnabled(False)
+        self.slider.sliderMoved.connect(self._on_seek)
+        self.slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{ border:1px solid {C_BORDER}; background:{C_WHITE}; height:6px; border-radius:3px; }}
+            QSlider::sub-page:horizontal {{ background:{C_BLUE}; border:1px solid #2980B9; height:6px; border-radius:3px; }}
+            QSlider::handle:horizontal {{ background:{C_DARK}; border:1px solid #1A252F; width:14px; margin-top:-4px; margin-bottom:-4px; border-radius:5px; }}
+        """)
+        left_body.addWidget(self.slider)
+        body.addLayout(left_body, stretch=1)
+
+        # 우측: 샴 전용 통계 패널
+        self.stats = SiameseStatsPanel()
+        body.addWidget(self.stats)
+
+        v.addLayout(body, stretch=1)
+
+    # ── 컨트롤 바 ──────────────────────────────────────────────
+    def _build_ctrl(self):
+        bar = QWidget()
+        bar.setFixedHeight(46)
+        bar.setStyleSheet(
+            f"background:{C_WHITE}; border:1px solid {C_BORDER}; border-radius:8px;")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(10, 0, 10, 0)
+        h.setSpacing(8)
+
+        h.addWidget(QLabel("🧬  샴 네트워크 실시간 관제"))
+        h.addStretch()
+
+        # 파일 열기 / 카메라
+        for text, slot in [("📂  파일 열기", self._open_file),
+                           ("📷  카메라 (0번)", self._open_cam)]:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            h.addWidget(b)
+
+        # ── 일시 정지 ─────────────────────────────────────
+        self.btn_pause = QPushButton("⏸ 일시 정지")
+        self.btn_pause.setStyleSheet(
+            f"background:{C_ORANGE};color:white;border:none;border-radius:6px;font-weight:bold;")
+        self.btn_pause.clicked.connect(self._toggle_pause)
+        self.btn_pause.setEnabled(False)
+        h.addWidget(self.btn_pause)
+
+        btn_stop = QPushButton("⏹ 종료")
+        btn_stop.setStyleSheet(
+            f"background:{C_RED};color:white;border:none;border-radius:6px;font-weight:bold;")
+        btn_stop.clicked.connect(self._stop)
+        h.addWidget(btn_stop)
+
+        # ── 샴큐 캡처 (샴수동학습용 큐) ───────────────────
+        btn_siam_cap = QPushButton("📸 샴큐 캡처")
+        btn_siam_cap.setFixedWidth(85)
+        btn_siam_cap.setStyleSheet(
+            f"background:#34495e;color:white;border:none;border-radius:6px;font-size:11px;font-weight:bold;")
+        btn_siam_cap.clicked.connect(self._capture_for_siamese)
+        h.addWidget(btn_siam_cap)
+
+        # ── 핵심 토글: YOLO ON / OFF ──────────────────────
+        self.btn_yolo = QPushButton("🔍 YOLO ON")
+        self.btn_yolo.setCheckable(True)
+        self.btn_yolo.setChecked(True)   # 기본 ON
+        self.btn_yolo.setFixedWidth(100)
+        self.btn_yolo.setStyleSheet(
+            f"QPushButton{{background:{C_BLUE};color:white;border:none;"
+            f"border-radius:6px;font-weight:bold;font-size:11px;}}"
+            f"QPushButton:!checked{{background:{C_BG};color:{C_DARK};"
+            f"border:1px solid {C_BORDER};border-radius:6px;font-size:11px;}}")
+        self.btn_yolo.setToolTip(
+            "ON:  YOLO로 모니터 영역을 잘라낸 뒤 샴 임베딩\n"
+            "OFF: 풀프레임 그대로 샴 임베딩 (YOLO 없이도 동작 가능 여부 확인)")
+        self.btn_yolo.clicked.connect(self._toggle_yolo)
+        h.addWidget(self.btn_yolo)
+
+        # ── 상태 표시 레이블 ──────────────────────────────
+        self.lbl_st = QLabel("● 대기")
+        self.lbl_st.setStyleSheet(
+            f"font-size:12px; font-weight:bold; color:{C_SUB}; padding-left:6px;")
+        h.addWidget(self.lbl_st)
+        return bar
+
+    # ── 토글 핸들러 ────────────────────────────────────────────
+    
+    def _capture_for_siamese(self):
+        """현재 YOLO 크롭(또는 풀프레임) 프레임을 data/siamese_train/_queue/ 에 저장"""
+        if not self._thread or self._thread._last_crop is None:
+            QMessageBox.warning(self, "캡처 실패", "영상을 재생 중이어야 합니다.")
+            return
+            
+        queue_dir = os.path.join(_ROOT, "data", "siamese_train", "_queue")
+        os.makedirs(queue_dir, exist_ok=True)
+        
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:18]
+        fname = f"sq_{ts}.png"
+        save_path = os.path.join(queue_dir, fname)
+        
+        try:
+            ret, buf = cv2.imencode(".png", self._thread._last_crop)
+            if ret:
+                buf.tofile(save_path)
+                cnt = len([f for f in os.listdir(queue_dir) if f.endswith(('.png','.jpg'))])
+                self.lbl_st.setText(f"● 샴큐 누적: {cnt}장")
+            else:
+                QMessageBox.critical(self, "캡처 실패", "이미지 인코딩 실패")
+        except Exception as ex:
+            QMessageBox.critical(self, "오류", str(ex))
+
+    def _toggle_pause(self):
+        if self._thread:
+            self._thread.pause_resume()
+            if self._thread._paused:
+                self.btn_pause.setText("▶ 계속 재생")
+                self.btn_pause.setStyleSheet(
+                    f"background:{C_GREEN};color:white;border:none;"
+                    f"border-radius:6px;font-weight:bold;")
+                self.lbl_st.setText("● 일시 정지됨")
+                self.lbl_st.setStyleSheet(
+                    f"font-size:12px; font-weight:bold; color:{C_ORANGE}; padding-left:6px;")
+            else:
+                self.btn_pause.setText("⏸ 일시 정지")
+                self.btn_pause.setStyleSheet(
+                    f"background:{C_ORANGE};color:white;border:none;"
+                    f"border-radius:6px;font-weight:bold;")
+                self.lbl_st.setText("● 분석 중...")
+                self.lbl_st.setStyleSheet(
+                    f"font-size:12px; font-weight:bold; color:{C_BLUE}; padding-left:6px;")
+
+    def _toggle_yolo(self):
+        """YOLO ON/OFF 실시간 전환 — 스레드 재시작으로 반영"""
+        self._use_yolo = self.btn_yolo.isChecked()
+        label = "🔍 YOLO ON" if self._use_yolo else "🔍 YOLO OFF"
+        self.btn_yolo.setText(label)
+        # 실행 중이면 현재 소스 기억 후 재시작
+        if self._thread and self._thread.isRunning():
+            src = self._thread.source
+            self._stop()
+            self._start(src)
+
+    # ── 소스 열기 ──────────────────────────────────────────────
+    def _open_file(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "영상 파일", _ROOT,
+            "Video (*.mp4 *.avi *.mov *.mkv)")
+        if p:
+            self._start(p)
+
+    def _open_cam(self):
+        self._start(0)
+
+    def _on_seek(self, value):
+        if self._thread:
+            self._thread.set_frame(value)
+
+    # ── 스레드 생명주기 ────────────────────────────────────────
+    def _start(self, src):
+        self._stop()
+        self.stats.pie.reset_cumulative()
+        self._thread = SiameseVideoThread(src, use_yolo=self._use_yolo)
+        self._thread.frame_signal.connect(
+            lambda qi: self.video.set_frame(QPixmap.fromImage(qi)))
+        self._thread.status_signal.connect(self._on_status)
+        self._thread.progress_signal.connect(self._on_progress)
+        self._thread.start()
+
+        self.btn_pause.setEnabled(True)
+        self.btn_pause.setText("⏸ 일시 정지")
+        self.btn_pause.setStyleSheet(
+            f"background:{C_ORANGE};color:white;border:none;"
+            f"border-radius:6px;font-weight:bold;")
+        self.slider.setEnabled(True)
+        self.lbl_st.setText("● 분석 중...")
+        self.lbl_st.setStyleSheet(
+            f"font-size:12px; font-weight:bold; color:{C_BLUE}; padding-left:6px;")
+
+    def _stop(self):
+        if self._thread and self._thread.isRunning():
+            self._thread.stop()
+        self._thread = None
+        self.btn_pause.setEnabled(False)
+        self.slider.setEnabled(False)
+        self.slider.setValue(0)
+        self.lbl_st.setText("● 정지")
+        self.lbl_st.setStyleSheet(
+            f"font-size:12px; font-weight:bold; color:{C_SUB}; padding-left:6px;")
+
+    # ── 시그널 수신 ────────────────────────────────────────────
+    def _on_progress(self, cur, tot):
+        if not self.slider.isSliderDown():
+            if self.slider.maximum() != tot:
+                self.slider.setRange(0, tot)
+            self.slider.blockSignals(True)
+            self.slider.setValue(cur)
+            self.slider.blockSignals(False)
+
+    def _on_status(self, fps, yolo_ms, embed_ms, sim_ms,
+                   similarity, is_ok, target_id):
+        self.stats.update_stats(
+            fps, yolo_ms, embed_ms, sim_ms,
+            similarity, is_ok, target_id, self._use_yolo)
+
+        col = C_GREEN if is_ok else C_RED
+        if is_ok and target_id:
+            st_text = f"● 타겟 {target_id} ✅  ({similarity:.1f}%)"
+        elif is_ok:
+            st_text = "● 정상 ✅"
+        else:
+            st_text = f"● 불일치 ❌  ({similarity:.1f}%)"
+        self.lbl_st.setText(st_text)
+        self.lbl_st.setStyleSheet(
+            f"font-size:12px; font-weight:bold; color:{col}; padding-left:6px;")
+
+    def closeEvent(self, e):
+        self._stop()
+        super().closeEvent(e)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  최종 MonitorTab (서브탭 A + 서브탭 B + 서브탭 C)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class MonitorTab(QWidget):
     def __init__(self):
@@ -1701,6 +2445,7 @@ class MonitorTab(QWidget):
                 border:1px solid {C_BORDER};border-bottom:none;border-radius:4px 4px 0 0; margin-right:2px;}}
             QTabBar::tab:selected{{background:{C_WHITE};color:{C_BLUE};border-bottom:2px solid {C_BLUE};}}
         """)
-        sub.addTab(LiveMonitorSubTab(), "  🎥  실시간 Live 관제  ")
-        sub.addTab(TargetROITab(),      "  🎯  타겟 뷰어 & ROI 설정  ")
+        sub.addTab(LiveMonitorSubTab(),      "  🎥  실시간 Live 관제  ")
+        sub.addTab(TargetROITab(),           "  🎯  타겟 뷰어 & ROI 설정  ")
+        sub.addTab(SiameseMonitorSubTab(),   "  🧬  샴 네트워크 관제  ")
         v.addWidget(sub)

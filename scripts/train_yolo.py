@@ -1,6 +1,6 @@
 """
 train_yolo.py — YOLO 재학습 스크립트
-- 실제 데이터셋: datasets/canon_monitor/canon_data.yaml 사용
+- 실제 데이터셋: data/yolo/canon_data.yaml 사용
 - Python 3.13 PyTorch 미호환 시 명확한 오류 메시지 반환
 """
 import os, sys, shutil, yaml, random
@@ -13,15 +13,15 @@ if _ROOT not in sys.path:
 BEST_MODEL   = os.path.join(_ROOT, "models", "canon_fast_yolo", "weights", "best.pt")
 # 세그멘테이션 기본 모델 — 로컬에 없으면 ultralytics가 자동 다운로드함
 BASE_MODEL   = "yolov8n-seg.pt"
-DATASET_YAML = os.path.join(_ROOT, "datasets", "canon_monitor", "canon_data.yaml")
+DATASET_YAML = os.path.join(_ROOT, "data", "yolo", "canon_data.yaml")
 
-# 보조 데이터 (dataset_target_and_1cycle/data 의 jpg+txt 쌍)
-AUX_DATA_DIR  = os.path.join(_ROOT, "dataset_target_and_1cycle", "data")
+# 보조 데이터 (data/yolo_source 의 jpg+txt 쌍)
+AUX_DATA_DIR  = os.path.join(_ROOT, "data", "yolo_source")
 # 메인 학습 이미지 폴더
-TRAIN_IMG_DIR = os.path.join(_ROOT, "datasets", "canon_monitor", "images", "train")
-TRAIN_LBL_DIR = os.path.join(_ROOT, "datasets", "canon_monitor", "labels", "train")
-VAL_IMG_DIR   = os.path.join(_ROOT, "datasets", "canon_monitor", "images", "val")
-VAL_LBL_DIR   = os.path.join(_ROOT, "datasets", "canon_monitor", "labels", "val")
+TRAIN_IMG_DIR = os.path.join(_ROOT, "data", "yolo", "images", "train")
+TRAIN_LBL_DIR = os.path.join(_ROOT, "data", "yolo", "labels", "train")
+VAL_IMG_DIR   = os.path.join(_ROOT, "data", "yolo", "images", "val")
+VAL_LBL_DIR   = os.path.join(_ROOT, "data", "yolo", "labels", "val")
 
 
 
@@ -49,8 +49,8 @@ def _check_pytorch() -> str:
 
 def _merge_aux_data(progress_cb=None):
     """
-    dataset_target_and_1cycle/data 의 jpg+txt 쌍을
-    datasets/canon_monitor/images+labels/train 으로 복사합니다.
+    data/yolo_source 의 jpg+txt 쌍을
+    data/yolo/images+labels/train 으로 복사합니다.
     이미지는 이미 있으면 덮지 않지만, 라벨(.txt)은 항상 최신으로 덮어쓰기
     (세그멘테이션 포맷으로 업데이트된 라벨 즉시 반영)
     """
@@ -260,7 +260,7 @@ def run_yolo_training(epochs: int = 30, imgsz: int = 640, progress_cb=None, mode
     if progress_cb: progress_cb(9, "Train/Val 데이터 무작위 분리 중 (8:2)...")
     n_trn, n_val = _split_train_val(val_ratio=0.2, progress_cb=progress_cb)
     if n_trn < 1:
-        msg = "Train 이미지가 없습니다! datasets/canon_monitor/images/train 폴더를 확인하세요."
+        msg = "Train 이미지가 없습니다! data/yolo/images/train 폴더를 확인하세요."
         if progress_cb: progress_cb(-1, msg)
         return {"error": msg, "map50": 0.0, "model_path": ""}
 
@@ -282,8 +282,8 @@ def run_yolo_training(epochs: int = 30, imgsz: int = 640, progress_cb=None, mode
     # ④ yaml 파일을 완전히 ASCII-safe 내용으로 재작성
     #    (한글 경로 파싱 문제를 근본 차단)
     #    ultralytics는 yaml 파일이 있는 폴더 상대경로를 지원하지 않으므로
-    #    작업 디렉토리를 datasets/canon_monitor 로 변경 후 상대 경로 사용
-    yaml_dir = os.path.join(_ROOT, "datasets", "canon_monitor")
+    #    작업 디렉토리를 data/yolo 로 변경 후 상대 경로 사용
+    yaml_dir = os.path.join(_ROOT, "data", "yolo")
     yaml_file = os.path.join(yaml_dir, "canon_data.yaml")
     yaml_content = (
         "nc: 1\n"

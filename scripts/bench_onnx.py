@@ -4,7 +4,7 @@ import time, os, sys, cv2, numpy as np
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(_ROOT, "bench_result.txt")
 
-img_dir = os.path.join(_ROOT, "datasets", "canon_monitor", "images", "train")
+img_dir = os.path.join(_ROOT, "data", "yolo", "images", "train")
 imgs = [f for f in os.listdir(img_dir) if f.endswith(".jpg")][:1]
 buf = np.fromfile(os.path.join(img_dir, imgs[0]), dtype=np.uint8)
 frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)

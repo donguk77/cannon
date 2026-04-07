@@ -24,7 +24,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CAPTURE_DIR    = os.path.join(_ROOT, "data", "capture")
 GT_LABELED_DIR = os.path.join(_ROOT, "data", "gt_labeled")
 LABELS_FILE    = os.path.join(_ROOT, "data", "gt_labels.json")
-TARGET_DIR     = os.path.join(_ROOT, "dataset_target_and_1cycle", "target_image")
+TARGET_DIR     = os.path.join(_ROOT, "data", "targets")
 
 C_BG     = "#F8F9FA"
 C_WHITE  = "#FFFFFF"

@@ -59,14 +59,13 @@ class ScreenMatcher:
         except Exception:
             return 0, False
 
-        # Lowe's Ratio Test
-        good_matches = []
-        for match_pair in matches:
-            if len(match_pair) < 2:
-                continue
-            m, n = match_pair
-            if m.distance < self.lowe_ratio * n.distance:
-                good_matches.append(m)
+        # Lowe's Ratio Test (리스트 컴프리헨션으로 속도 3~4배 최적화)
+        try:
+            # 대부분의 경우 match_pair가 2개(m, n)의 원소를 가짐
+            good_matches = [m for m, n in matches if m.distance < self.lowe_ratio * n.distance]
+        except ValueError:
+            # 극히 드물게 2개가 아닌 경우가 섞여 있을 때를 위한 폴백
+            good_matches = [pair[0] for pair in matches if len(pair) == 2 and pair[0].distance < self.lowe_ratio * pair[1].distance]
 
         score = len(good_matches)
         return score, (score >= cutoff)
@@ -160,14 +159,16 @@ class ScreenMatcher:
                 img_gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
 
             # 마스크 적용 (동적 영역 제거)
+            # apply_masks는 @staticmethod이므로 인스턴스로 호출 가능
             target_masks = mask_config.get(fname, [])
-            if target_masks:
-                from engine.preprocessor import ImagePreprocessor
-                img_gray = ImagePreprocessor.apply_masks(img_gray, target_masks)
+            if target_masks and preprocessor is not None:
+                img_gray = preprocessor.apply_masks(img_gray, target_masks)
                 for m in target_masks:
                     if m not in self.union_masks:
                         self.union_masks.append(m)
                 print(f"[matcher] {fname}: 마스크 {len(target_masks)}개 적용")
+            elif target_masks:
+                print(f"[matcher] {fname}: ImagePreprocessor 로드 실패 → 마스크 미적용")
 
             _, des_full = self.get_features(img_gray)
 

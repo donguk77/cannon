@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import os
+import json
 
 class BezelDetector:
     """
@@ -44,9 +45,19 @@ class BezelDetector:
         성공 시 self.last_corners 에 4코너 좌표 저장 (오버레이 표시용).
         """
         self.last_corners = None
-        # imgsz=320: 모니터는 큰 물체라 낮은 해상도에서도 정확히 탐지되면서 속도 2배 향상
-        # 벤치마크: 640→45ms, 480→37ms, 320→28ms (모두 box+mask 정상)
-        results = self.model(frame, verbose=False, imgsz=320)
+        
+        # UI에서 변경 가능한 해상도 설정 로드 (기본값 640)
+        target_imgsz = 640
+        try:
+            cfg_path = os.path.join(os.path.dirname(__file__), "..", "data", "params_config.json")
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    target_imgsz = int(cfg.get("yolo_imgsz", 640))
+        except:
+            pass
+
+        results = self.model(frame, verbose=False, imgsz=target_imgsz)
 
         if not (len(results) > 0 and len(results[0].boxes) > 0):
             return None, None
@@ -194,15 +205,15 @@ class BezelDetector:
         임의의 N점을 [좌상, 우상, 우하, 좌하] 순서로 정렬합니다.
           - 좌상: x+y 최소
           - 우하: x+y 최대
-          - 우상: x-y 최소 (x 크고 y 작음)
-          - 좌하: x-y 최대 (x 작고 y 큼)
+          - 우상: x-y 최대 (x 크고 y 작음)
+          - 좌하: x-y 최소 (x 작고 y 큼)
         """
         pts  = np.array(pts, dtype=np.float32)
         s    = pts.sum(axis=1)
         diff = pts[:, 0] - pts[:, 1]
         return np.array([
-            pts[np.argmin(s)],
-            pts[np.argmin(diff)],
-            pts[np.argmax(s)],
-            pts[np.argmax(diff)],
+            pts[np.argmin(s)],       # 좌상
+            pts[np.argmax(diff)],    # 우상
+            pts[np.argmax(s)],       # 우하
+            pts[np.argmin(diff)],    # 좌하
         ], dtype=np.float32)

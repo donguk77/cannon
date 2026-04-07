@@ -94,3 +94,22 @@ desktop.ini
 # 벤치마크 / 실행 결과물
 # ===========================
 bench_result.txt
+
+# ===========================
+# 루트 임시 진단 스크립트 & 결과물
+# (scripts/ 폴더에 정식 버전이 있음)
+# ===========================
+check_anchor.py
+deep_diagnose.py
+deep_diagnose2.py
+run_diag.py
+test_detector.py
+verify_fc.py
+verify_siamese.py
+anchor_info.txt
+deep_diag_out.txt
+deep_result.txt
+diagnose_out.txt
+diagnose_result.txt
+diag_utf8.txt
+verify_out.txt

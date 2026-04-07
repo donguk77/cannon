@@ -37,7 +37,10 @@ DEFAULT_CONFIG = {
     "clahe_clip_limit": 2.0,
     "clahe_tile_grid": 8,
     "MATCH_THRESHOLD": 60,
-    "PENDING_THRESHOLD": 70,
+    "yolo_imgsz": 640,
+    "blur_ksize": 0,
+    "gamma": 1.0,
+    "sharpen_amount": 1.0,
 }
 
 
@@ -60,7 +63,7 @@ def save_params_config(values: dict):
         json.dump(values, f, indent=4, ensure_ascii=False)
 
 
-TARGET_DIR = os.path.join(_ROOT, "dataset_target_and_1cycle", "target_image")
+TARGET_DIR = os.path.join(_ROOT, "data", "targets")
 
 # ─── 정답 데이터 기반 파라미터 최적화 스레드 ────────────────────────────────
 class GroundTruthOptimizerThread(QThread):
@@ -129,7 +132,16 @@ class GroundTruthOptimizerThread(QThread):
             return
 
         # ③ 그리드 탐색
-        sharp_k = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+        # 현재 설정에서 blur/gamma/sharpen 값 로드 (탐색 대상 아님 — 환경 보정 파라미터)
+        _cur_cfg     = load_params_config()
+        _blur_ksize  = int(_cur_cfg.get("blur_ksize", 0))
+        _gamma_val   = float(_cur_cfg.get("gamma", 1.0))
+        _sharpen_amt = float(_cur_cfg.get("sharpen_amount", 1.0))
+        if abs(_gamma_val - 1.0) > 0.01:
+            _gamma_lut = (np.power(np.arange(256) / 255.0, _gamma_val) * 255).astype(np.uint8)
+        else:
+            _gamma_lut = None
+
         combos  = list(itertools.product(self._NF, self._LR, self._CL, self._CT))
         total   = len(combos)
 
@@ -145,9 +157,17 @@ class GroundTruthOptimizerThread(QThread):
             orb   = cv2.ORB_create(nfeatures=nf)
             bf    = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
-            def _pre(img):
+            def _pre(img, _bk=_blur_ksize, _gl=_gamma_lut, _sa=_sharpen_amt):
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                return cv2.filter2D(clahe.apply(gray), -1, sharp_k)
+                if _bk > 0:
+                    gray = cv2.GaussianBlur(gray, (_bk, _bk), 0)
+                if _gl is not None:
+                    gray = cv2.LUT(gray, _gl)
+                enhanced = clahe.apply(gray)
+                if _sa > 0.0:
+                    blur5 = cv2.GaussianBlur(enhanced, (5, 5), 1.0)
+                    return cv2.addWeighted(enhanced, 1.0 + _sa, blur5, -_sa, 0)
+                return enhanced
 
             def _match(dA, dB):
                 if dA is None or dB is None or len(dA) == 0 or len(dB) == 0:
@@ -419,7 +439,16 @@ class ParamOptimizerThread(QThread):
             self.finished.emit({}, "타겟 이미지가 2개 이상 필요합니다.")
             return
 
-        sharp_k = np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]])
+        # 현재 설정에서 blur/gamma/sharpen 값 로드 (탐색 대상 아님 — 환경 보정 파라미터)
+        _cur_cfg       = load_params_config()
+        _blur_ksize    = int(_cur_cfg.get("blur_ksize", 0))
+        _gamma_val     = float(_cur_cfg.get("gamma", 1.0))
+        _sharpen_amt   = float(_cur_cfg.get("sharpen_amount", 1.0))
+        if abs(_gamma_val - 1.0) > 0.01:
+            _gamma_lut = (np.power(np.arange(256) / 255.0, _gamma_val) * 255).astype(np.uint8)
+        else:
+            _gamma_lut = None
+
         combos  = list(itertools.product(self._NF, self._LR, self._CL, self._CT))
         total   = len(combos)
 
@@ -438,8 +467,17 @@ class ParamOptimizerThread(QThread):
             # ② 각 타겟 전처리 + 특징점 추출
             features = []   # (fname, des_orig, des_noisy)
             for fname, img in imgs:
-                gray   = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                enh    = cv2.filter2D(clahe.apply(gray), -1, sharp_k)
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                if _blur_ksize > 0:
+                    gray = cv2.GaussianBlur(gray, (_blur_ksize, _blur_ksize), 0)
+                if _gamma_lut is not None:
+                    gray = cv2.LUT(gray, _gamma_lut)
+                enhanced = clahe.apply(gray)
+                if _sharpen_amt > 0.0:
+                    blur5 = cv2.GaussianBlur(enhanced, (5, 5), 1.0)
+                    enh = cv2.addWeighted(enhanced, 1.0 + _sharpen_amt, blur5, -_sharpen_amt, 0)
+                else:
+                    enh = enhanced
                 # 카메라-스크린샷 도메인 갭 시뮬레이션: 약한 노이즈 + 밝기 변화
                 noise  = (np.random.randint(-12, 13, enh.shape)).astype(np.int16)
                 noisy  = np.clip(enh.astype(np.int16) + noise, 0, 255).astype(np.uint8)
@@ -719,7 +757,33 @@ PARAMS = [
         "step": 1,
     },
 
+    # ── YOLO 모델 설정 ──────────────────────────────────────────────────────────
+    {
+        "name": "yolo_imgsz",
+        "full_name": "YOLO 추론 해상도 (imgsz)",
+        "category": "YOLO 모델 설정",
+        "category_color": C_ORANGE,
+        "default": "640",
+        "unit": "픽셀",
+        "range": "256 ~ 1280",
+        "short": "YOLO 인공지능이 사물을 인식할 때 축소해서 바라보는 해상도 크기",
+        "detail": (
+            "학습된 모델의 환경(예: 640)과 일치해야 최적의 정밀도가 나옵니다.\n"
+            "숫자를 내리면(예: 320) 연산이 빨라져 저사양 PC에 매우 유리하지만,\n"
+            "마스크 경계가 깨지면서 원본으로 확대 시 화면 테두리가 요동치게 됩니다."
+        ),
+        "up":   "마스크 경계가 정밀해져 모니터 원근 보정이 자리에 딱 맞게 단단하게 이뤄집니다.\n→ 단, 픽셀 수가 기하급수적으로 늘어 연산 속도가 다소 느려집니다.",
+        "down": "픽셀 수가 줄어 추론 속도가 급격히 빨라집니다. (프레임 방어)\n→ 단, 마스크 테두리에 계단 현상이 생기며 보정 화면이 널뛰기할 수 있습니다.",
+        "tip":  "현재 모델이 학습한 근본 해상도인 640 유지를 강력 권장합니다.\n속도 확보가 절실하다면 480 정도를 중간 타협점으로 테스트하세요.",
+        "param_key": "yolo_imgsz",
+        "input_type": "int",
+        "val_min": 256,
+        "val_max": 1280,
+        "step": 32,
+    },
+
     # ── 전처리 ────────────────────────────────────────────────────────────────
+
     {
         "name": "clahe_clip_limit",
         "full_name": "CLAHE clipLimit (조명 보정 강도)",
@@ -769,25 +833,85 @@ PARAMS = [
         "step": 2,
     },
     {
-        "name": "sharpen_strength",
-        "full_name": "Sharpening 강도 (윤곽선 강조)",
+        "name": "blur_ksize",
+        "full_name": "Blur 커널 크기 (노이즈·모아레 제거)",
         "category": "전처리 (Preprocessing)",
         "category_color": C_YELLOW,
-        "default": "1.0 (고정 커널)",
-        "unit": "(배율)",
+        "default": "0",
+        "unit": "(픽셀)",
+        "range": "0 / 3 / 5 / 7",
+        "short": "CLAHE 전에 적용하는 가우시안 블러 크기. 0=꺼짐",
+        "detail": (
+            "카메라로 모니터를 촬영하면 픽셀 격자 간섭으로 '모아레(줄무늬) 패턴'이 생깁니다.\n"
+            "ORB는 이 패턴을 실제 특징점으로 오인하여 타겟(스크린샷)에 없는\n"
+            "가짜 매칭을 만들어 점수를 낮춥니다.\n\n"
+            "가우시안 블러를 CLAHE 이전에 적용하면 이 노이즈를 제거할 수 있습니다.\n"
+            "단, 너무 강하면 UI 텍스트·버튼 엣지도 뭉개져서 특징점 수가 줄어듭니다.\n"
+            "0=꺼짐, 3=가벼운 제거, 5=중간, 7=강한 제거 (홀수만 유효)"
+        ),
+        "up":   "모아레·카메라 노이즈가 제거되어 가짜 특징점이 줄어듭니다.\n값이 너무 크면 엣지가 뭉개져 ORB 키포인트 수가 감소합니다.",
+        "down": "블러가 약해져 노이즈 특징점이 늘어납니다.\n0=꺼짐으로 설정하면 기존 동작 그대로 유지됩니다.",
+        "tip":  "먼저 3으로 시작해 매칭 점수를 확인하세요.\n카메라 품질이 좋으면 0(꺼짐)이 더 나을 수 있습니다.\n모아레가 심한 환경이면 5까지 올려보세요.",
+        "param_key": "blur_ksize",
+        "input_type": "int",
+        "val_min": 0,
+        "val_max": 7,
+        "step": 2,
+    },
+    {
+        "name": "gamma",
+        "full_name": "Gamma 보정 (어두운 화면 선보정)",
+        "category": "전처리 (Preprocessing)",
+        "category_color": C_YELLOW,
+        "default": "1.0",
+        "unit": "(지수)",
+        "range": "0.50 ~ 2.00",
+        "short": "CLAHE 전에 적용하는 감마 보정. 1.0=꺼짐, 0.7=밝게",
+        "detail": (
+            "공장 조명 절약 모드나 야간 촬영 환경에서 모니터 화면이 전체적으로 어두울 때,\n"
+            "CLAHE만으로는 협소한 밝기 구간 안에서만 조정하므로 효과가 제한됩니다.\n\n"
+            "감마 보정을 먼저 적용해 화면을 밝혀두면 CLAHE가 더 넓은\n"
+            "동적 범위에서 작동하여 특징점 추출 품질이 향상됩니다.\n\n"
+            "γ < 1.0 → 어두운 화면을 밝게 (0.7~0.9: 약간 밝게)\n"
+            "γ = 1.0 → 변화 없음 (꺼짐)\n"
+            "γ > 1.0 → 밝은 화면을 어둡게 (역광 보정 시)"
+        ),
+        "up":   "γ값이 커질수록 화면이 더 어두워집니다.\n역광·과노출 환경에서는 1.2~1.5가 도움이 됩니다.",
+        "down": "γ값이 작아질수록 화면이 더 밝아집니다.\n어두운 공장 조명 환경이라면 0.7~0.9를 먼저 시도하세요.",
+        "tip":  "일반적인 밝기 환경에서는 1.0(꺼짐)을 유지하세요.\n화면이 전반적으로 어두워 특징점이 잘 안 잡힐 때 0.8로 내려보세요.",
+        "param_key": "gamma",
+        "input_type": "float",
+        "val_min": 0.50,
+        "val_max": 2.00,
+        "step": 0.05,
+    },
+    {
+        "name": "sharpen_amount",
+        "full_name": "Sharpening 강도 (언샤프 마스킹)",
+        "category": "전처리 (Preprocessing)",
+        "category_color": C_YELLOW,
+        "default": "1.0",
+        "unit": "(강도)",
         "range": "0.0 ~ 3.0",
         "short": "글자·버튼 테두리를 얼마나 날카롭게 강조할지",
         "detail": (
             "ORB는 코너처럼 '변화가 큰 지점'에 특징점을 찍습니다.\n"
-            "샤프닝 커널은 인접 픽셀 차이를 증폭시켜 테두리를 더 선명하게 만들어,\n"
-            "ORB가 UI 요소의 경계에 정확히 특징점을 찍도록 유도합니다.\n"
-            "현재는 고정 3×3 커널( [-1,-1,-1 / -1,9,-1 / -1,-1,-1] )을 사용합니다."
+            "언샤프 마스킹(Unsharp Masking)은 원본에서 블러 버전을 빼는 방식으로\n"
+            "엣지를 강조하여 ORB가 UI 경계에 정확히 특징점을 찍도록 유도합니다.\n\n"
+            "result = (1+amount) × 원본  −  amount × 가우시안블러(5×5)\n\n"
+            "0.0: 샤프닝 없음 (CLAHE 결과 그대로)\n"
+            "1.0: 중간 강도 (기본값)\n"
+            "2.0: 강한 강도\n"
+            "3.0: 매우 강함 (노이즈 이미지에서 역효과 주의)"
         ),
-        "up":   "특징점이 테두리에 집중되어 매칭 정확도가 높아집니다.\n과하면 이미지 전체가 거칠어져 오히려 특징점이 노이즈에 몰립니다.",
-        "down": "부드러운 이미지가 되어 코너 감지가 약해집니다.",
-        "tip":  "텍스트·아이콘이 뚜렷한 화면이면 1.0~1.5가 적당합니다.\n흐릿하거나 저해상도 카메라라면 2.0~2.5도 시도해보세요.",
-        "param_key": None,  # 현재 고정 커널 사용 — 편집 불가
-        "input_type": None,
+        "up":   "특징점이 테두리에 집중되어 매칭 정확도가 높아집니다.\n과하면 이미지 전체가 거칠어져 노이즈 특징점이 늘어납니다.",
+        "down": "부드러운 이미지가 되어 코너 감지가 약해집니다.\n0.0으로 설정하면 CLAHE 직후 이미지 그대로 ORB에 전달됩니다.",
+        "tip":  "텍스트·아이콘이 뚜렷한 화면이면 1.0이 적당합니다.\n카메라가 흐릿하거나 원거리 촬영이라면 1.5~2.0을 시도하세요.\n블러(blur_ksize)를 올렸다면 샤프닝도 같이 올려 균형을 맞추세요.",
+        "param_key": "sharpen_amount",
+        "input_type": "float",
+        "val_min": 0.0,
+        "val_max": 3.0,
+        "step": 0.25,
     },
 
     # ── 마스킹 ────────────────────────────────────────────────────────────────
@@ -839,31 +963,10 @@ PARAMS = [
         "val_max": 100,
         "step": 5,
     },
-    {
-        "name": "PENDING_THRESHOLD",
-        "full_name": "PENDING_THRESHOLD (Pending 저장 기준)",
-        "category": "시스템 임계값",
-        "category_color": C_GREEN,
-        "default": "70",
-        "unit": "점 (ORB 점수)",
-        "range": "MATCH_THRESHOLD ~ 100",
-        "short": "이 점수 미만이면 원본 이미지를 pending 폴더에 자동 저장",
-        "detail": (
-            "FAIL 판정이 나면 나중에 야간 학습에 쓸 수 있도록\n"
-            "원본 영상을 data/pending/ 폴더에 저장합니다.\n"
-            "MATCH_THRESHOLD와 이 값 사이가 '애매한 구간'이 됩니다.\n"
-            "예) MATCH=60, PENDING=70이면 60~70점 구간도 pending에 저장됩니다."
-        ),
-        "up":   "더 많은 이미지가 pending에 쌓입니다.\n야간 학습 데이터가 풍부해지지만 저장 용량이 빠르게 늘어납니다.",
-        "down": "MATCH_THRESHOLD와 같게 설정하면 FAIL된 것만 저장됩니다.",
-        "tip":  "디스크 공간이 충분하다면 PENDING을 높게 유지해서\n다양한 경계 사례를 수집하는 것이 학습에 유리합니다.",
-        "param_key": "PENDING_THRESHOLD",
-        "input_type": "int",
-        "val_min": 30,
-        "val_max": 100,
-        "step": 5,
-    },
 ]
+# NOTE: PENDING_THRESHOLD 항목은 제거됨.
+# pending 저장 방식이 고정 임계값에서 MATCH_THRESHOLD 기준 ±margin(2~3점) Hard Mining으로
+# 변경되어 이 파라미터는 더 이상 동작에 영향을 주지 않습니다.
 
 
 # ─── 위젯 빌더 헬퍼 ─────────────────────────────────────────────────────────
@@ -942,19 +1045,25 @@ class ParamCard(QWidget):
         effect_grid = QHBoxLayout()
         effect_grid.setSpacing(10)
 
+        # 올리면: 오렌지 파스텔 배경 (기존 갈색→선명한 주황 계열)
         up_w = QWidget()
-        up_w.setStyleSheet(f"background:{C_RED}11; border-radius:6px; border:1px solid {C_RED}44;")
+        up_w.setStyleSheet(
+            "background:#FFF3E0; border-radius:6px; border:1px solid #FFB74D;"
+        )
         up_v = QVBoxLayout(up_w)
         up_v.setContentsMargins(12, 8, 12, 8); up_v.setSpacing(4)
-        up_v.addWidget(_lbl("  값을 올리면 (↑)", size=12, bold=True, color=C_RED, wrap=False))
+        up_v.addWidget(_lbl("값을 올리면 (↑)", size=12, bold=True, color="#E65100", wrap=False))
         up_v.addWidget(_lbl(p["up"], size=12, color=C_DARK))
         effect_grid.addWidget(up_w, stretch=1)
 
+        # 내리면: 스카이블루 파스텔 배경
         down_w = QWidget()
-        down_w.setStyleSheet(f"background:{C_BLUE}11; border-radius:6px; border:1px solid {C_BLUE}44;")
+        down_w.setStyleSheet(
+            "background:#E3F2FD; border-radius:6px; border:1px solid #64B5F6;"
+        )
         down_v = QVBoxLayout(down_w)
         down_v.setContentsMargins(12, 8, 12, 8); down_v.setSpacing(4)
-        down_v.addWidget(_lbl("  값을 내리면 (↓)", size=12, bold=True, color=C_BLUE, wrap=False))
+        down_v.addWidget(_lbl("값을 내리면 (↓)", size=12, bold=True, color="#1565C0", wrap=False))
         down_v.addWidget(_lbl(p["down"], size=12, color=C_DARK))
         effect_grid.addWidget(down_w, stretch=1)
 
@@ -963,11 +1072,11 @@ class ParamCard(QWidget):
         # ── 팁 ────────────────────────────────────────────────
         tip_w = QWidget()
         tip_w.setStyleSheet(
-            f"background:{C_GREEN}0D; border-radius:6px; border:1px solid {C_GREEN}44;"
+            "background:#E8F5E9; border-radius:6px; border:1px solid #81C784;"
         )
         tip_v = QVBoxLayout(tip_w)
         tip_v.setContentsMargins(12, 8, 12, 8); tip_v.setSpacing(2)
-        tip_v.addWidget(_lbl("  실전 팁", size=12, bold=True, color=C_GREEN, wrap=False))
+        tip_v.addWidget(_lbl("실전 팁", size=12, bold=True, color="#2E7D32", wrap=False))
         tip_v.addWidget(_lbl(p["tip"], size=12, color=C_DARK))
         outer.addWidget(tip_w)
 
@@ -1064,14 +1173,14 @@ class CategoryHeader(QWidget):
         h.addWidget(l)
         h.addStretch()
 
-
 # ─── 메인 탭 ────────────────────────────────────────────────────────────────
 class GuideTab(QWidget):
-    """탭 4: 파라미터 가이드 (값 편집 + 저장 기능 포함)"""
+    """탭 4: 파라미터 가이드 (설정 패널 + 가이드북 분리)"""
     def __init__(self):
         super().__init__()
         self.setStyleSheet(f"background:{C_BG};")
-        self._cards = []  # (param_key, ParamCard)
+        self._cards          = []   # [(param_key, ParamCard)] — 가이드북 카드
+        self._compact_fields = {}   # {param_key: (spinbox, input_type)} — 설정 패널 스핀박스
 
         cfg = load_params_config()
 
@@ -1081,37 +1190,48 @@ class GuideTab(QWidget):
 
         # ── 상단 제목 바 ───────────────────────────────────────
         title_bar = QWidget()
-        title_bar.setFixedHeight(64)
+        title_bar.setFixedHeight(52)
         title_bar.setStyleSheet(f"background:{C_WHITE}; border-bottom:1px solid {C_BORDER};")
         tb = QHBoxLayout(title_bar)
-        tb.setContentsMargins(28, 0, 28, 0)
-        tb.addWidget(_lbl("  파라미터 가이드", size=18, bold=True, color=C_DARK, wrap=False))
-        tb.addWidget(_lbl("설정값을 변경한 뒤 [설정 저장] 버튼을 누르면 다음 실행부터 적용됩니다.",
-                          size=12, color=C_SUB, wrap=False))
+        tb.setContentsMargins(24, 0, 24, 0)
+        tb.addWidget(_lbl("  파라미터 가이드", size=17, bold=True, color=C_DARK, wrap=False))
+        tb.addWidget(_lbl("  [설정] 탭에서 값을 조정하고 저장하세요. [가이드북] 탭에서 각 변수의 의미를 확인하세요.",
+                          size=11, color=C_SUB, wrap=False))
         tb.addStretch()
-
-        save_btn = QPushButton("  설정 저장")
-        save_btn.setFixedHeight(36)
-        save_btn.setFixedWidth(120)
-        save_btn.setStyleSheet(
-            f"QPushButton {{ background:{C_GREEN}; color:white; border:none;"
-            f"  border-radius:6px; font-size:13px; font-weight:bold; }}"
-            f"QPushButton:hover {{ background:#219a52; }}"
-            f"QPushButton:pressed {{ background:#1a7a42; }}"
-        )
-        save_btn.clicked.connect(self._on_save)
-        tb.addWidget(save_btn)
         root.addWidget(title_bar)
 
-        # ── 자동 최적화 패널 (탭: 타겟 간 분석 | 정답 데이터 기반) ──
-        opt_tabs = QTabWidget()
-        opt_tabs.setStyleSheet(
-            f"QTabWidget::pane{{background:{C_WHITE};border:none;}}"
-            f"QTabBar::tab{{padding:6px 18px;font-size:12px;color:{C_SUB};}}"
+        # ── 메인 탭: [파라미터 설정] | [가이드북] ──────────────────
+        main_tabs = QTabWidget()
+        main_tabs.setStyleSheet(
+            f"QTabWidget::pane{{background:{C_BG};border:none;}}"
+            f"QTabBar::tab{{padding:8px 22px;font-size:12px;color:{C_SUB};}}"
             f"QTabBar::tab:selected{{color:{C_DARK};font-weight:bold;"
             f"border-bottom:2px solid {C_BLUE};}}"
         )
 
+        # ══════════════════════════════════════════════════════
+        # 탭 1: 파라미터 설정 (좌: 자동최적화 / 우: 컴팩트 변수 설정)
+        # ══════════════════════════════════════════════════════
+        settings_tab = QWidget()
+        settings_tab.setStyleSheet(f"background:{C_BG};")
+        settings_h = QHBoxLayout(settings_tab)
+        settings_h.setContentsMargins(12, 12, 12, 12)
+        settings_h.setSpacing(12)
+
+        # ── 좌측: 자동 최적화 패널 (55%) ─────────────────────────
+        left_box = QWidget()
+        left_box.setStyleSheet(f"background:{C_WHITE};border:1px solid {C_BORDER};border-radius:8px;")
+        left_v = QVBoxLayout(left_box)
+        left_v.setContentsMargins(0, 0, 0, 0)
+        left_v.setSpacing(0)
+
+        opt_tabs = QTabWidget()
+        opt_tabs.setStyleSheet(
+            f"QTabWidget::pane{{background:{C_WHITE};border:none;}}"
+            f"QTabBar::tab{{padding:6px 16px;font-size:11px;color:{C_SUB};}}"
+            f"QTabBar::tab:selected{{color:{C_DARK};font-weight:bold;"
+            f"border-bottom:2px solid {C_BLUE};}}"
+        )
         self._opt_panel = OptimizerPanel()
         self._opt_panel.apply_requested.connect(self._on_apply_optimal)
         opt_tabs.addTab(self._opt_panel, "타겟 간 자동 분석")
@@ -1120,74 +1240,264 @@ class GuideTab(QWidget):
         self._gt_panel.apply_requested.connect(self._on_apply_optimal)
         opt_tabs.addTab(self._gt_panel, "정답 데이터 기반 분석")
 
-        root.addWidget(opt_tabs)
+        left_v.addWidget(opt_tabs)
+        settings_h.addWidget(left_box, stretch=55)
 
-        # ── 스크롤 영역 ────────────────────────────────────────
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet(f"background:{C_BG}; border:none;")
+        # ── 우측: 컴팩트 변수 설정 패널 (45%) ─────────────────────
+        right_box = QWidget()
+        right_box.setStyleSheet(f"background:{C_WHITE};border:1px solid {C_BORDER};border-radius:8px;")
+        right_v = QVBoxLayout(right_box)
+        right_v.setContentsMargins(14, 12, 14, 14)
+        right_v.setSpacing(8)
 
-        content = QWidget()
-        content.setStyleSheet(f"background:{C_BG};")
-        v = QVBoxLayout(content)
-        v.setContentsMargins(24, 20, 24, 28)
-        v.setSpacing(12)
+        # 헤더 (타이틀 + 저장 버튼)
+        hdr_row = QHBoxLayout()
+        hdr_row.addWidget(_lbl("변수 설정", size=14, bold=True, color=C_DARK, wrap=False))
+        hdr_row.addStretch()
+        save_btn = QPushButton("설정 저장")
+        save_btn.setFixedHeight(32)
+        save_btn.setMinimumWidth(90)
+        save_btn.setStyleSheet(
+            f"QPushButton{{background:{C_GREEN};color:white;border:none;"
+            f"border-radius:6px;font-size:12px;font-weight:bold;padding:0 12px;}}"
+            f"QPushButton:hover{{background:#219a52;}}"
+        )
+        save_btn.clicked.connect(self._on_save)
+        hdr_row.addWidget(save_btn)
+        right_v.addLayout(hdr_row)
 
-        categories_order = [
+        hint_lbl = _lbl("값을 변경하면 노란색으로 강조됩니다.", size=10, color=C_SUB)
+        right_v.addWidget(hint_lbl)
+
+        # 스크롤 가능한 변수 폼
+        compact_scroll = QScrollArea()
+        compact_scroll.setWidgetResizable(True)
+        compact_scroll.setFrameShape(QFrame.NoFrame)
+        compact_scroll.setStyleSheet(
+            f"QScrollArea{{background:{C_WHITE};border:none;}}"
+            f"QScrollBar:vertical{{width:5px;background:{C_BG};}}"
+            f"QScrollBar::handle:vertical{{background:{C_BORDER};border-radius:2px;}}"
+        )
+
+        compact_content = QWidget()
+        compact_content.setStyleSheet(f"background:{C_WHITE};")
+        cv = QVBoxLayout(compact_content)
+        cv.setContentsMargins(0, 4, 4, 4)
+        cv.setSpacing(3)
+
+        # 카테고리별 변수 배치 (마스킹은 편집 불가라 제외)
+        cat_order = [
+            ("YOLO 모델 설정",         C_ORANGE),
+            ("ORB 특징점 추출",        C_BLUE),
+            ("전처리 (Preprocessing)", C_YELLOW),
+            ("시스템 임계값",          C_GREEN),
+        ]
+        params_by_cat = {}
+        for p in PARAMS:
+            if p.get("input_type") is not None:
+                params_by_cat.setdefault(p["category"], []).append(p)
+
+        for cat_name, cat_color in cat_order:
+            items = params_by_cat.get(cat_name, [])
+            if not items:
+                continue
+
+            # 카테고리 헤더
+            cat_hdr = QWidget()
+            cat_hdr.setFixedHeight(26)
+            cat_hdr.setStyleSheet(
+                f"background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+                f"stop:0 {cat_color},stop:0.7 {cat_color}88,stop:1 transparent);"
+                f"border-radius:4px;"
+            )
+            ch = QHBoxLayout(cat_hdr)
+            ch.setContentsMargins(10, 0, 10, 0)
+            ch_lbl = QLabel(cat_name)
+            ch_lbl.setStyleSheet(
+                "font-size:11px;font-weight:bold;color:white;background:transparent;border:none;"
+            )
+            ch.addWidget(ch_lbl)
+            cv.addWidget(cat_hdr)
+
+            for p in items:
+                row_key   = p["param_key"]
+                row_color = p["category_color"]
+                default_str = p["default"]
+                # default 값 파싱 (숫자만 추출)
+                try:
+                    default_v = int(default_str) if p["input_type"] == "int" else float(default_str)
+                except (ValueError, TypeError):
+                    default_v = 0
+
+                row_w = QWidget()
+                row_w.setStyleSheet(f"background:{C_WHITE};border-radius:4px;")
+                row_h = QHBoxLayout(row_w)
+                row_h.setContentsMargins(6, 4, 6, 4)
+                row_h.setSpacing(8)
+
+                # 파라미터 이름 레이블
+                name_lbl = QLabel(p["name"])
+                name_lbl.setStyleSheet(
+                    f"font-size:11px;color:{C_DARK};font-weight:bold;"
+                )
+                name_lbl.setFixedWidth(155)
+                row_h.addWidget(name_lbl)
+
+                # 스핀박스 생성
+                current = cfg.get(row_key)
+                if p["input_type"] == "int":
+                    sb = QSpinBox()
+                    sb.setMinimum(p["val_min"])
+                    sb.setMaximum(p["val_max"])
+                    sb.setSingleStep(p["step"])
+                    sb.setValue(int(current) if current is not None else int(default_v))
+                else:
+                    sb = QDoubleSpinBox()
+                    sb.setMinimum(p["val_min"])
+                    sb.setMaximum(p["val_max"])
+                    sb.setSingleStep(p["step"])
+                    sb.setDecimals(2)
+                    sb.setValue(float(current) if current is not None else float(default_v))
+
+                sb.setFixedWidth(82)
+                sb.setFixedHeight(26)
+                sb.setStyleSheet(
+                    f"QSpinBox, QDoubleSpinBox {{"
+                    f"border:1px solid {row_color};border-radius:4px;"
+                    f"padding:1px 3px;font-size:12px;font-weight:bold;color:{C_DARK};background:white;}}"
+                    f"QSpinBox::up-button, QDoubleSpinBox::up-button,"
+                    f"QSpinBox::down-button, QDoubleSpinBox::down-button{{width:16px;}}"
+                )
+
+                # 색상 피드백 (값 변경 시 배경색 노랑으로)
+                def _make_updater(rw, dv, color):
+                    def _update(val):
+                        if abs(float(val) - float(dv)) < 0.001:
+                            rw.setStyleSheet(f"background:{C_WHITE};border-radius:4px;")
+                        else:
+                            rw.setStyleSheet(
+                                f"background:#FFFBEA;border-radius:4px;"
+                                f"border-left:3px solid {color};"
+                            )
+                    return _update
+
+                updater = _make_updater(row_w, default_v, row_color)
+                sb.valueChanged.connect(updater)
+                updater(sb.value())  # 초기 색상 설정
+
+                row_h.addWidget(sb)
+
+                # 단위 레이블
+                unit_lbl = QLabel(p["unit"])
+                unit_lbl.setStyleSheet(f"font-size:10px;color:{C_SUB};")
+                row_h.addWidget(unit_lbl)
+                row_h.addStretch()
+
+                cv.addWidget(row_w)
+                self._compact_fields[row_key] = (sb, p["input_type"])
+
+            cv.addSpacing(6)
+
+        cv.addStretch()
+        compact_scroll.setWidget(compact_content)
+        right_v.addWidget(compact_scroll, stretch=1)
+
+        settings_h.addWidget(right_box, stretch=45)
+        main_tabs.addTab(settings_tab, "파라미터 설정")
+
+        # ══════════════════════════════════════════════════════
+        # 탭 2: 가이드북 (기존 ParamCards — 설명 중심)
+        # ══════════════════════════════════════════════════════
+        guidebook_tab = QWidget()
+        guidebook_tab.setStyleSheet(f"background:{C_BG};")
+        gb_v = QVBoxLayout(guidebook_tab)
+        gb_v.setContentsMargins(0, 0, 0, 0)
+        gb_v.setSpacing(0)
+
+        guide_scroll = QScrollArea()
+        guide_scroll.setWidgetResizable(True)
+        guide_scroll.setFrameShape(QFrame.NoFrame)
+        guide_scroll.setStyleSheet(f"background:{C_BG};border:none;")
+
+        guide_content = QWidget()
+        guide_content.setStyleSheet(f"background:{C_BG};")
+        gv = QVBoxLayout(guide_content)
+        gv.setContentsMargins(24, 20, 24, 28)
+        gv.setSpacing(12)
+
+        cat_order_full = [
+            ("YOLO 모델 설정",         C_ORANGE),
             ("ORB 특징점 추출",        C_BLUE),
             ("전처리 (Preprocessing)", C_YELLOW),
             ("마스킹",                 C_RED),
             ("시스템 임계값",          C_GREEN),
         ]
-
-        params_by_cat = {}
+        all_params_by_cat = {}
         for p in PARAMS:
-            params_by_cat.setdefault(p["category"], []).append(p)
+            all_params_by_cat.setdefault(p["category"], []).append(p)
 
-        for cat_name, cat_color in categories_order:
-            items = params_by_cat.get(cat_name, [])
+        for cat_name, cat_color in cat_order_full:
+            items = all_params_by_cat.get(cat_name, [])
             if not items:
                 continue
-            v.addWidget(CategoryHeader(cat_name, cat_color))
-            for p in items:
+            gv.addWidget(CategoryHeader(cat_name, cat_color))
+            # ── 2열 그리드로 카드 배치 (가로 길이 압박 해소) ──
+            row_h = None
+            for idx, p in enumerate(items):
                 current_val = cfg.get(p.get("param_key")) if p.get("param_key") else None
                 card = ParamCard(p, current_val)
+                card.setMaximumWidth(560)          # 카드 최대 너비 제한
+                card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
                 if p.get("param_key"):
                     self._cards.append((p["param_key"], card))
-                v.addWidget(card)
-            v.addSpacing(8)
+                if idx % 2 == 0:
+                    row_h = QHBoxLayout()
+                    row_h.setSpacing(10)
+                    row_h.addWidget(card)
+                else:
+                    row_h.addWidget(card)
+                    gv.addLayout(row_h)
+                    row_h = None
+            # 홀수 개인 경우 마지막 카드 처리
+            if row_h is not None:
+                row_h.addStretch(1)
+                gv.addLayout(row_h)
+            gv.addSpacing(8)
 
-        v.addStretch()
-        scroll.setWidget(content)
-        root.addWidget(scroll, stretch=1)
+        gv.addStretch()
+        guide_scroll.setWidget(guide_content)
+        gb_v.addWidget(guide_scroll)
+
+        main_tabs.addTab(guidebook_tab, "가이드북")
+        root.addWidget(main_tabs, stretch=1)
 
     def _on_apply_optimal(self, best_params: dict):
-        """최적화 결과를 스핀박스에 반영"""
+        """최적화 결과를 컴팩트 스핀박스와 가이드북 카드에 모두 반영"""
         applied = []
+        # 컴팩트 패널
+        for key, (sb, input_type) in self._compact_fields.items():
+            if key in best_params:
+                val = best_params[key]
+                sb.setValue(int(val) if input_type == "int" else float(val))
+                applied.append(f"{key} = {val}")
+        # 가이드북 카드 (동기화)
         for key, card in self._cards:
             if key in best_params and card.spinbox is not None:
                 val = best_params[key]
-                if card.input_type == "int":
-                    card.spinbox.setValue(int(val))
-                elif card.input_type == "float":
-                    card.spinbox.setValue(float(val))
-                applied.append(f"{key} = {val}")
+                card.spinbox.setValue(int(val) if card.input_type == "int" else float(val))
         if applied:
             QMessageBox.information(
                 self, "적용 완료",
-                "최적값이 스핀박스에 반영되었습니다.\n\n"
+                "최적값이 설정 패널에 반영되었습니다.\n\n"
                 + "\n".join(applied)
                 + "\n\n[설정 저장] 버튼을 눌러 파일에 저장하세요."
             )
 
     def _on_save(self):
-        """현재 스핀박스 값을 params_config.json에 저장"""
+        """컴팩트 패널 스핀박스 값을 params_config.json에 저장"""
         cfg = load_params_config()
-        for key, card in self._cards:
-            val = card.get_value()
-            if val is not None:
-                cfg[key] = val
+        for key, (sb, input_type) in self._compact_fields.items():
+            cfg[key] = sb.value()
         try:
             save_params_config(cfg)
             QMessageBox.information(
@@ -1197,3 +1507,4 @@ class GuideTab(QWidget):
             )
         except Exception as e:
             QMessageBox.critical(self, "저장 실패", f"설정 파일 저장 중 오류가 발생했습니다.\n{e}")
+

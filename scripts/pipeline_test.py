@@ -3,7 +3,7 @@ pipeline_test.py — 실제 데이터로 전체 파이프라인을 검증하는 
 
 [연결 데이터 구성]
   - YOLO 모델  : yolov8n.pt (사전학습 가중치, 베젤 탐지용)
-  - ORB 타겟   : dataset_target_and_1cycle/target_image/1.png ~ 4.png
+  - ORB 타겟   : data/targets/1.png ~ 4.png
   - 테스트 영상: dataset_video/1-1.mp4 (또는 1-2.mp4, 4.mp4)
 
 [실행 방법]
@@ -27,7 +27,7 @@ from engine.frame_skipper import FrameSkipper
 from engine.ocr_fallback  import OCRFallback
 
 # ─── 경로 상수 (프로젝트 루트 기준 절대경로) ────────────────────
-TARGET_IMAGE_DIR = os.path.join(_ROOT, "dataset_target_and_1cycle", "target_image")
+TARGET_IMAGE_DIR = os.path.join(_ROOT, "data", "targets")
 DEFAULT_VIDEO    = os.path.join(_ROOT, "dataset_video", "1-1.mp4")
 YOLO_MODEL_PATH  = os.path.join(_ROOT, "yolov8n.pt")   # 사전학습 모델
 

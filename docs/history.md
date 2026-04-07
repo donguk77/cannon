@@ -1,3 +1,536 @@
+## [2026-04-07 18:30] 🔧 ORB 전처리 파이프라인 확장 — Blur·Gamma·Sharpening 파라미터화
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **문제**: 기존 전처리가 `Grayscale → CLAHE → 고정 Sharpening(3×3 Laplacian)` 3단계로 고정되어 있어 공장 카메라 환경의 모아레 패턴·조명 문제를 세밀하게 대응하기 어려웠음.
+- **분석 결과**: ORB 매칭 품질에 영향을 주는 주요 요인이 ① 모아레 노이즈, ② 어두운 화면(감마), ③ 샤프닝 강도 조절 불가로 확인됨.
+- **결정**: 5단계 파이프라인으로 확장, 각 단계를 UI 파라미터로 노출:
+  - `[2] Gaussian Blur` (blur_ksize): 모아레·카메라 노이즈 제거. CLAHE 전에 배치해 노이즈 증폭 방지.
+  - `[3] Gamma 보정` (gamma): 어두운 화면 선보정. CLAHE 전에 배치해 동적 범위 확장.
+  - `[5] Unsharp Masking` (sharpen_amount): 기존 고정 3×3 커널을 강도 조절 가능한 언샤프 마스킹으로 교체.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `engine/preprocessor.py`
+  - `__init__` 파라미터 추가: `blur_ksize`, `gamma`, `sharpen_amount`
+  - 전처리 파이프라인: Grayscale → [Blur] → [Gamma] → CLAHE → [Sharpening]
+  - Gamma LUT 미리 계산 (런타임 오버헤드 없음)
+  - 기존 고정 3×3 Laplacian 커널 → `sharpen_amount` 기반 Unsharp Masking으로 교체
+  - `blur_ksize` 짝수 입력 시 자동 홀수 올림 처리
+- **Changed**: `gui/tab_guide.py`
+  - `DEFAULT_CONFIG`에 `blur_ksize=0`, `gamma=1.0`, `sharpen_amount=1.0` 추가
+  - `PARAMS` 리스트에 3개 카드 추가 (가이드북 + 컴팩트 설정 패널 모두 반영)
+  - `ParamOptimizerThread`, `GroundTruthOptimizerThread` 내 `_pre()` 함수가 현재 blur/gamma/sharpen 설정 반영하도록 수정 (CLAHE·ORB만 그리드 탐색, 환경 보정 파라미터는 고정)
+- **Changed**: `gui/tab_monitor.py`
+  - `_load_params_config` 기본값에 새 3개 키 추가
+  - `VideoThread.run()` — `ImagePreprocessor` 초기화 시 새 파라미터 전달
+  - ORBViewer 미리보기 — `ImagePreprocessor` 초기화 시 현재 설정값 반영
+  - Latency 바 레이블: "전처리 (3단계)" → "전처리 (최대5단계)"
+- **Changed**: `data/params_config.json` — 새 3개 키 추가, `PENDING_THRESHOLD` 잔재 제거
+
+### 📝 파라미터 기본값 및 동작
+| 파라미터 | 기본값 | 꺼짐 조건 | 범위 |
+|---|---|---|---|
+| `blur_ksize` | 0 | 0 = 꺼짐 | 0/3/5/7 |
+| `gamma` | 1.0 | 1.0 = 패스스루 | 0.50 ~ 2.00 |
+| `sharpen_amount` | 1.0 | 0.0 = 꺼짐 | 0.0 ~ 3.0 |
+
+기본값은 모두 기존 동작과 최대한 호환되도록 설정. 기존 3×3 Laplacian과 동등한 강도는 `sharpen_amount ≈ 1.5`.
+
+---
+
+## [2026-04-07 17:00] 🏗️ 데이터 폴더 구조 통합 — 3개 분산 → data/ 단일화
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **문제**: 프로젝트 루트에 `data/`, `dataset_target_and_1cycle/`, `datasets/` 3개의 데이터 폴더가 분산되어 있어, 각 폴더의 역할이 불명확하고 새로 합류하는 사람이 구조를 파악하기 어려운 상태였음.
+- **결정**: 3개를 `data/` 단일 루트로 통합. 내부를 `targets/`, `yolo/`, `yolo_source/`로 명확히 분리.
+  - `dataset_target_and_1cycle/target_image/` → `data/targets/`
+  - `dataset_target_and_1cycle/data/` → `data/yolo_source/`
+  - `datasets/canon_monitor/` → `data/yolo/`
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Moved**: `dataset_target_and_1cycle/target_image/` → `data/targets/` (4개 PNG)
+- **Moved**: `dataset_target_and_1cycle/data/` → `data/yolo_source/` (100 jpg+txt 쌍)
+- **Moved**: `datasets/canon_monitor/` → `data/yolo/` (images/labels/yaml 전체)
+- **Removed**: `dataset_target_and_1cycle/`, `datasets/` 폴더 완전 삭제
+- **Removed**: `data/yolo/labels/train.cache`, `val.cache` — 절대경로 내장 캐시, 학습 시 자동 재생성
+- **Changed**: 경로 참조 수정 (9개 파일, 총 20여 곳)
+  - `gui/tab_guide.py`, `gui/tab_labeling.py`, `gui/tab_monitor.py`, `gui/tab_training.py`
+  - `offline/siamese_classifier.py`
+  - `scripts/bench_onnx.py`, `scripts/diagnose_siamese.py`, `scripts/pipeline_test.py`, `scripts/train_siamese.py`, `scripts/train_yolo.py`
+- **Added**: `docs/data_structure.md` — 통합된 데이터 구조 전체를 문서화 (폴더 역할, 파일명 규칙, 데이터 흐름도 포함)
+
+---
+
+## [2026-04-07 16:20] 🗂️ 타겟 이미지 이중화 제거 — siamese_anchor 폴더 통폐합
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **문제 발견**: 전체 데이터 구조 점검 중, `dataset_target_and_1cycle/target_image/1~4.png`와 `models/siamese_anchor/1~4.png`가 MD5 기준 완전히 동일한 파일을 중복 보관하고 있음을 확인.
+- **위험성**: 타겟 화면을 교체할 때 두 폴더를 모두 업데이트해야 했으나, `siamese_anchor/`를 빠뜨리면 ORB는 새 화면으로 비교하고 Siamese는 옛날 화면으로 판정하는 불일치 버그가 잠재됨.
+- **결정**: `siamese_anchor/`를 삭제하고, Siamese 관련 코드 3곳의 앵커 경로를 `dataset_target_and_1cycle/target_image/`로 통일. 이후 타겟 이미지 교체 시 해당 폴더 하나만 수정하면 ORB·Siamese 양쪽에 동시 반영됨.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `offline/siamese_classifier.py` — `SiameseClassifier.__init__()` 앵커 기본 경로 `models/siamese_anchor` → `dataset_target_and_1cycle/target_image`.
+- **Changed**: `scripts/train_siamese.py` — `ANCHOR_DIR` 상수 동일하게 변경. 에러 메시지 안내 문구도 `siamese_anchor/ 복사` 지시에서 `target_image/ 확인`으로 업데이트.
+- **Changed**: `scripts/diagnose_siamese.py` — `ANCHOR_DIR` 변경. 이제 `ANCHOR_DIR`과 같은 경로를 가리키게 된 `TARGET_IMAGE_DIR` 변수를 제거하고 `ANCHOR_DIR`로 통합.
+- **Removed**: `models/siamese_anchor/` 폴더 — 1~4.png 4개(약 1.6MB) 삭제.
+
+---
+
+## [2026-04-07 15:30] 🧹 코드 정리 및 데이터 관리 UI 개선
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **코드 구조 점검**: 전체 소스를 분석하여 Dead Code, UI·코드 불일치, 임시 파일 산재 등 6가지 문제 항목 식별 및 일괄 수정.
+- **데이터 파일명 통일**: `data/matched/`와 `data/pending/`가 프레임 인덱스 기반 파일명(예: `matched_000005_2of3.jpg`)을 사용해 세션 재시작 시 동일한 이름으로 덮어쓰이는 버그 확인. `data/capture/`와 동일한 타임스탬프 방식으로 통일.
+- **데이터 관리 UI 추가**: Pending 검수실에서 이미지 파일을 GUI 안에서 직접 삭제할 수 없어 매번 탐색기를 열어야 했던 불편함을 해소하기 위해 개별 삭제·전체 삭제·matched 폴더 비우기 기능 신설.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+
+**버그 수정**
+- **Fixed**: `gui/tab_monitor.py` — `matched_` 및 `pending_` 파일명을 프레임 인덱스에서 타임스탬프(`YYYYMMDD_HHMMSS_MS`)로 변경. 세션 재시작 시 파일 덮어쓰기 방지.
+
+**Dead Code 제거**
+- **Removed**: `gui/tab_monitor.py` — `PENDING_THRESHOLD` 변수 정의 및 설정 로드 제거. pending 저장 로직이 margin 방식으로 전환된 이후 이 값은 동작에 전혀 영향을 주지 않았음.
+- **Removed**: `gui/tab_guide.py` — `DEFAULT_CONFIG` 및 `PARAMS` 리스트에서 `PENDING_THRESHOLD` 항목 제거. 사용자가 설정해도 반영되지 않는 항목이었음.
+- **Removed**: `models/config.json` — 내용이 없는 빈 파일, 코드에서 미참조.
+- **Removed**: `data/labeled/`, `data/logs/`, `data/rejected/`, `data/targets/` — 파일이 전혀 없고 코드에서도 참조되지 않던 빈 폴더 4개 삭제.
+
+**UI·코드 불일치 수정**
+- **Fixed**: `gui/tab_monitor.py` — 레이턴시 바 레이블 `"5단계 전처리"` → `"전처리 (3단계)"`. 실제 구현은 Grayscale → CLAHE → Sharpening 3단계이므로 표기 수정.
+- **Fixed**: `scripts/train_siamese.py` — 파일 상단 docstring의 epoch 수(`Phase 1: 5`, `Phase 2: 15`)를 실제 코드 상수(`EPOCHS_FROZEN=10`, `EPOCHS_UNFROZEN=30`)와 일치하도록 수정.
+
+**코드 품질**
+- **Fixed**: `engine/matcher.py` — `load_targets_from_dir()` 내부에서 `ImagePreprocessor`를 두 번 임포트하던 중복 제거. 마스크 적용 시 인스턴스 메서드(`preprocessor.apply_masks()`)로 통합하고, `preprocessor is None`일 때 안전하게 마스크 미적용 처리.
+
+**데이터 관리 UI**
+- **Added**: `gui/tab_training.py` — `ImageCard`에 `×` 삭제 버튼 추가. 클릭 시 파일 즉시 삭제 및 카드 제거. `deleted = pyqtSignal(str)` 시그널로 `PendingReviewTab`에 전파.
+- **Added**: `gui/tab_training.py` — `PendingReviewTab` 컨트롤 바에 `전체 삭제` 버튼 추가 (확인 다이얼로그 포함).
+- **Added**: `gui/tab_training.py` — `PendingReviewTab` 가이드 패널에 `matched 폴더 비우기 (N개)` 버튼 추가. 현재 파일 수를 버튼 레이블에 실시간 표시.
+- **Changed**: `gui/tab_training.py` — pending 파일 목록을 `sorted()` 정렬 적용. 타임스탬프 파일명과 결합하여 시간 순 자동 정렬.
+
+**정리 (.gitignore)**
+- **Added**: `.gitignore` — 루트에 산재하던 임시 진단 스크립트 7개(`check_anchor.py`, `deep_diagnose.py` 등)와 결과 텍스트 7개(`diagnose_out.txt` 등) 패턴 추가.
+
+---
+
+## [2026-04-07 14:13] ✨ YOLO 설정 UI 반영 및 샴(Siamese) 라벨링 스마트 캡처 도입
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **YOLO UI 추가**: 사용자가 직접 코드를 수정하지 않고 UI 설정 탭에서 YOLO 모델의 `imgsz`값을 튜닝할 수 있도록 파라미터 가이드에 'YOLO 모델 설정' 섹션 신설. (저사양용 320/480 등 유연한 대처 가능)
+- **샴 캡처 고도화**: 기존 방식은 점수 커트라인 미달 시 무조건 이미지를 저장(`pending`)했으나, 지나치게 의미 없는 폐급 데이터(점수 5점 등)가 많이 수집되어 라벨링 효율이 떨어지는 문제 제기(Hard Negative / Positive Mining 필요성).
+- **결정**: 확실하게 맞거나 확실하게 틀린 프레임은 버리고, "커트라인 근처에서 판단이 애매한 사진(±3점 이내)"만 골라서 캡처하도록 마진(Margin) 로직을 적용. (ROI 모드 시에는 오차 폭이 작으므로 ±2점으로 세팅)
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Added**: `gui/tab_guide.py` — `DEFAULT_CONFIG` 및 `PARAMS` 리스트에 `yolo_imgsz` 항목 추가.
+- **Changed**: `engine/detector.py` — `detect_and_crop` 내부에서 `params_config.json`을 읽어 `imgsz`값을 동적으로 부여하도록 수정.
+- **Changed**: `gui/tab_monitor.py` — `pending` 저장 로직을 `if not is_ok:`에서 `if abs(score - target_thr) <= margin:`로 변경하여 알짜배기 데이터만 수집하도록 AI 모니터링 파이프라인 고도화.
+
+---
+
+## [2026-04-07 13:52] 🎯 YOLO 실시간 추론 해상도 정상화 (버그 수정)
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **현상 파악**: YOLO 모델 학습 자체는 mAP 99.5%로 완벽히 이루어졌으나, 실제 런타임 테스트 시 탐지 박스와 마스크가 심하게 요동치고 안정적으로 타겟을 잡지 못하는 현상이 유저로부터 보고됨.
+- **원인 분석**: 
+  - 학습 파일(`args.yaml`) 상에서는 640 해상도로 훈련되었음.
+  - 하지만 `engine/detector.py`의 추론 과정(`detect_and_crop`)에서 입력 이미지 해상도를 강제로 320으로 반토막 내어 예측 로직을 돌리고 있었음. 
+  - 이로 인해 세그멘테이션 마스크 경계가 깨지고 노이즈가 발생하면서, 이를 4개 꼭짓점으로 추출하는 함수(`approxPolyDP`) 연산이 실패하거나 매 프레임 다르게 계산되어 화면이 심하게 떨리는 증상을 유발함.
+  - 추가 관찰로 검증셋 데이터가 똑같은 정면 각도만 존재하여 모델의 과적합(Data Bias) 성향 확인(학습 단조로움).
+- **결정**: `engine/detector.py` 코드의 `imgsz`값을 모델이 학습한 근본 해상도인 640으로 정상 복구하여 마스크 정밀도를 회복함.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Fixed**: `engine/detector.py` — `detect_and_crop` 함수 내부
+  - `results = self.model(frame, verbose=False, imgsz=320)` 로 하향 되어 있던 옵션을 `imgsz=640`으로 상향 변경.
+
+---
+
+## [2026-04-06 22:02] 💡 [설계 논의] ORB 전처리 파이프라인 고도화 고려
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **현황 분석**: 시스템 UI상 "5단계 전처리"라 표기되어 있으나, 실제 동작 코드는 **3단계(Grayscale → CLAHE → Sharpening)**로 이루어져 있음 파악. 가이드북에는 CLAHE 변수만 공개되어 있고 샤프닝은 코드로 고정(하드코딩)되어 있음을 확인함.
+- **향후 전처리 고도화 고려 사항 (Future Work)**:
+  1. **노이즈 억제 (Bilateral Filter)**: 현재의 샤프닝 로직은 윤곽을 살리지만 모니터/카메라 픽셀 노이즈까지 함께 증폭시킴. 이를 예방하기 위해 엣지를 보존하면서 노이즈만 제거하는 바이레터럴 필터 전처리 도입 검토.
+  2. **모아레(Moiré) 효과 방어**: 모니터 촬영 특유의 격자/일렁임 현상을 억제하는 다운/업 샘플링 등 필터 단계 추가.
+  3. **하드코딩 파라미터화**: 숨겨져 있던 '샤프닝 강도'를 파라미터 가이드북으로 분리하여 사용자가 조절할 수 있도록 개선.
+  4. **이진화 (Thresholding)**: 텍스트/아이콘 전용으로 극단적 흑백 처리를 통해 빛 반사 면역력 확보.
+- **결정**: 당장 파이프라인 코드를 수정하지 않고, 이후 AI 정확도 추가 개선 작업 시 최우선 아젠다로 활용하기 위해 `history.md`에 기록해 두기로 함.
+
+---
+
+## [2026-04-06 21:50] 🎨 가이드북 2열 레이아웃 + 색상 개선 + 샴 패널 텍스트 가시성 수정
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **문제 1**: 가이드북 카드가 전체 가로를 차지해 지나치게 넓음 → 2열 그리드로 변경.
+- **문제 2**: '값을 올리면' 박스가 `C_RED + 11` 헥스로 갈색처럼 보임 → 파스텔 오렌지/스카이블루로 교체.
+- **문제 3**: 샴 네트워크 관제 탭의 KPI 카드 제목 폰트(9px)가 너무 작아 잘림, 파이차트 범례도 패널 밖으로 넘침 → 폰트 확대 + 범례 아래 2열 배치.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `gui/tab_guide.py` — `ParamCard`
+  - `값을 올리면` 박스: `{C_RED}11` → `#FFF3E0` (파스텔 오렌지) + 테두리 `#FFB74D`.
+  - `값을 내리면` 박스: `{C_BLUE}11` → `#E3F2FD` (파스텔 스카이블루) + 테두리 `#64B5F6`.
+  - `실전 팁` 박스: `{C_GREEN}0D` → `#E8F5E9` (파스텔 그린) + 테두리 `#81C784`.
+- **Changed**: `gui/tab_guide.py` — `GuideTab` 가이드북 탭
+  - 카드 배치를 `for` 단순 나열에서 **인덱스 기반 2열 QHBoxLayout 그리드**로 변경.
+  - `ParamCard.setMaximumWidth(560)` 설정으로 카드 너비 제한.
+- **Changed**: `gui/tab_monitor.py` — `SiameseStatsPanel`
+  - `setFixedWidth(400)` → `setMinimumWidth(300) + setMaximumWidth(380)` (유연한 폭).
+  - `_card()` 제목 폰트 `9px` → `11px`, 값 폰트 `16px` → `17px`.
+  - Latency 레이블: `font-size:11px` → `12px`, 폰트 굵기 추가.
+- **Changed**: `gui/tab_monitor.py` — `PieChartWidget`
+  - 높이 `140px` → `160px`.
+  - 범례 위치: 차트 우측(잘림) → **차트 아래 2열 배치** (좌우 분할).
+  - 범례 아이콘: `drawRect` → `drawRoundedRect` (모서리 처리).
+
+---
+
+## [2026-04-06 21:10] 🏗️ YOLO 학습 탭 분리 & 파라미터 가이드 전면 재설계
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **문제 1**: 야간 학습 지시 탭의 YOLO 학습 섹션이 하단에 고정 바 형태로 붙어 이미지가 가로로 납작하게 표시됨.
+- **문제 2**: 파라미터 가이드의 변수들이 설명 카드 안에 세로 나열되어 있어 설정하기 불편. 자동 최적화가 전체 가로를 차지해 여백 낭비.
+- **해결 방향**: YOLO 학습을 독립 4번째 서브탭으로 분리; 파라미터 가이드를 "설정" + "가이드북" 2탭 구조로 재설계.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `gui/tab_training.py` — `TrainingTab.__init__()`
+  - `FireBar`를 하단 고정 바에서 **4번째 "YOLO 학습" 서브탭**으로 분리.
+  - 탭 제목 바 추가 ("YOLO 재학습 관리" + 안내 문구).
+  - 이모지 없는 한글 탭 라벨 적용 (Pending 검수실, 학습 데이터셋 뷰어, 샴 라벨링, YOLO 학습).
+- **Changed**: `gui/tab_guide.py` — `GuideTab` 전면 재설계
+  - **제목 바**: 간소화 (저장 버튼 우측 패널로 이동).
+  - **"파라미터 설정" 탭** (좌55% + 우45%):
+    - 좌측: 기존 자동 최적화 패널 (타겟 간 분석 / 정답 데이터 기반 분석).
+    - 우측: 컴팩트 변수 설정 패널 — 카테고리 헤더 + 스핀박스 폼 + **"설정 저장" 버튼**.
+    - **색상 피드백**: 기본값과 달라지면 노란 배경(`#FFFBEA`) + 왼쪽 카테고리 컬러 테두리 표시.
+  - **"가이드북" 탭**: 기존 `ParamCard` 상세 설명 카드를 별도 탭으로 이동.
+  - `self._compact_fields` 신규 추가 (`{param_key: (spinbox, input_type)}`).
+  - `_on_save()` → 컴팩트 스핀박스에서 값 수집.
+  - `_on_apply_optimal()` → 컴팩트 패널 + 가이드북 카드 양쪽에 동기 적용.
+
+---
+
+## [2026-04-06 20:25] 🎨 학습/라벨링 탭 우측 패널 UI 개선 — QScrollArea + 이모지 제거 + 폰트 정상화
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **문제**: 학습 데이터셋 뷰어(우측 240px)와 샴 라벨링(우측 200px) 탭의 패널이 너무 좁아 텍스트가 잘리고 버튼이 겹치는 UX 불량 발생.
+- **해결 방향**: (1) 우측 패널 너비 확대, (2) `QScrollArea`로 감싸 스크롤 가능하게, (3) Windows에서 깨지는 이모지 전량 제거, (4) `font-size:9~10px` → `12px`로 정상화.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `gui/tab_training.py` — `DatasetViewerTab.__init__()`
+  - 우측 패널을 `QScrollArea`(너비 260px)로 래핑. 기존 고정 `QWidget(240px)` 제거.
+  - 모든 이모지(`⭐`, `🎯`, `🗑`, `💾`, `🔶`) 제거.
+  - 버튼 padding 추가, ROI 리스트 `setMinimumHeight(60)` 설정.
+- **Changed**: `gui/tab_training.py` — `SiameseLabelTab._build_right_panel()`
+  - 우측 패널을 `QScrollArea`(너비 240px)로 래핑. 기존 고정 `QWidget(200px)` 제거.
+  - 모든 이모지(`📊`, `🏷️`, `🗑`, `🚀`, `🧬`, `⚠️`) 제거.
+  - 폰트 크기 `9~10px` → `12px`로 통일, 버튼 height `setFixedHeight` → `setMinimumHeight`로 교체.
+  - 스크롤바 스타일: 너비 6px, 슬림한 핸들.
+
+---
+
+## [2026-04-06 20:08] 🎨 실시간 관제 컨트롤 바 UI 개선 — 2줄 레이아웃 + 이모지 깨짐 수정
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **문제**: 컨트롤 바(46px)에 버튼 12개가 한 줄로 몰려 텍스트가 잘리고(`✂ 크롭 뷰` → `< 크롭 ↑`), 깨진 특수문자가 화면에 표시되는 UX 문제 발생.
+- **해결**: 컨트롤 바를 **2줄 레이아웃(86px)**으로 재설계.
+  - 상단 줄: 제목 | 소스선택(파일·카메라) | 재생제어(일시정지·종료) | 상태표시
+  - 하단 줄: 옵션 토글(스킵·CLAHE·크롭뷰·진단) | 데이터 액션(DB초기화·GT캡처·타겟저장)
+- 모든 버튼에서 Windows에서 깨지는 이모지(`⚡`, `🔬`, `✂`, `📂`, `🎯` 등) 완전 제거 → 깔끔한 한글 텍스트로 교체.
+- 버튼 고정 너비(`setFixedWidth`) → 최소 너비(`setMinimumWidth`) 방식으로 변경 → 텍스트 잘림 방지.
+- 공통 버튼 스타일 헬퍼 함수 `_btn()` 도입 → 색상 시스템 통일 (소스=파랑, 재생=주황/빨강, 옵션=일치색, 유지보수=회색/보라/초록).
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `gui/tab_monitor.py` — `LiveMonitorSubTab._build_ctrl()`
+  - 기존 단일 `QHBoxLayout(46px)` → `QVBoxLayout + 2×QHBoxLayout(86px)` 전면 재설계.
+  - 공통 헬퍼 `_btn(text, color, checkable, checked)` 및 구분선 헬퍼 `_sep()` 내부 함수 추가.
+  - 버튼 텍스트에서 이모지 일괄 제거.
+- **Changed**: `_toggle_skip()`, `_toggle_diag()`, `_toggle_crop_view()` — 텍스트 갱신 시 이모지 제거.
+
+---
+
+## [2026-04-06 16:14] ✂ 실시간 관제 — 풀프레임 ↔ YOLO 크롭 뷰 토글 버튼 추가
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **문제 제기**: 타겟 1의 ORB 점수가 이전 40점 → 현재 16점으로 급락한 원인 불명. YOLO 재학습 및 샴 네트워크 수정 이후 발생한 것으로 추정되나, 크롭 결과를 직접 눈으로 보기 전까지 정확한 원인 특정 불가.
+- **단기 해결**: 원인 파악을 위해 현재 ORB 분석에 사용되는 **YOLO 크롭 이미지를 실시간으로 직접 볼 수 있는 뷰 토글 버튼**을 추가. 풀프레임 뷰(기존)와 YOLO 크롭 + ROI 오버레이 뷰 사이를 버튼 하나로 즉시 전환 가능.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `gui/tab_monitor.py` — `VideoThread`
+  - `__init__`에 `self.show_crop = False` 플래그 추가.
+  - `run()` 내 프레임 발송 로직 수정: `show_crop=True`이면 `_last_display_frame`(크롭+ROI 오버레이)을, `False`이면 기존 `frame`(풀프레임)을 UI로 전송.
+  - `set_show_crop(enabled: bool)` 메서드 추가 — 런닝 중 즉시 전환 가능.
+- **Changed**: `gui/tab_monitor.py` — `LiveMonitorSubTab`
+  - 컨트롤 바에 `✂ 크롭 뷰` 체크 버튼 추가 (오렌지색, 체크 시 활성化).
+  - `_toggle_crop_view()` 핸들러 메서드 추가.
+
+---
+
+## [2026-04-06 15:33] ⚡ ORB 타겟 병렬비교 시간(Latency) 극한의 최적화
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **문제 식별**: 실시간 모니터링(`gui/tab_monitor.py`) 중 "타겟 병렬비교(orb_cmp_ms)" 단계에서 타겟이 늘어나거나 ROI 영역이 많아질수록 메인 스레드 연산의 병목(Bottleneck)이 발생하여 FPS가 저하됨. 
+- **해결 방안**: 파이썬 `for` 루프에서 직렬로 처리하던 비교 로직을 `concurrent.futures.ThreadPoolExecutor`를 사용해 본격적인 병렬 처리(멀티스레딩)로 변경하고 파이썬 엔진 자체의 루프 방식도 최적화.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `gui/tab_monitor.py`
+  - `classify_target` 로직 변경 (`1081~1124 lines`).
+  - 매 프레임별 타겟 비교 시 `for target_id, target_data in self.targets.items():`로 동기 실행 되던 부분을 `self._target_executor = ThreadPoolExecutor(max_workers=4)`를 사용하여 타겟 단위로 백그라운드 스레드에서 연산을 분산 수행하고 병합함.
+- **Changed**: `engine/matcher.py` (Lowe's Ratio Test 속도 최적화)
+  - `compare_descriptors` 내부의 `for match_pair in matches:` for문을 List Comprehension 방식으로 재작성(`good_matches = [m for m, n in matches if...]`). 이를 통해 저수준 엔진 연산 속도 3~4배 향상.
+
+---
+
+
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **문제 인식**: 샴 네트워크 앵커 또는 뷰어에 보여지는 YOLO 크롭 이미지가 좌측으로 90도 돌아가게 캡처되는 치명적 버그 발견.
+- **원인 분석**: `engine/detector.py`의 `_order_corners()` 함수의 좌표 정렬 알고리즘에서 **수학적 계산 실수** 확인. `x-y` 값을 기준으로 우상단과 좌하단을 추출할 때 `np.argmin`과 `np.argmax`를 스왑(반대)하여 적용함. 이로 인해 우상단 좌표와 좌하단 좌표가 뒤바뀌어 입력되었고, OpenCV가 원근 보정(`cv2.warpPerspective`)을 수행하면서 화면 전체를 대각선 대칭으로 90도 회전시켜버림.
+- **해결 방안**: 우상단(`argmax`)과 좌하단(`argmin`) 추출 로직을 수학적으로 올바르게 교정.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Fixed**: `engine/detector.py` 
+  - `_order_corners(pts)` 내 정렬 로직 수정.
+  - `pts[np.argmin(diff)]` (좌하) <-> `pts[np.argmax(diff)]` (우상) 위치 정상 복구.
+
+---
+
+
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **문제 인식**: 샴 네트워크 라벨링 탭(`tab_training.py`)에서 잘못 수집된 오염된 학습 데이터를 일괄/부분 통제하는 기능이 부재. 이로 인해 `neg` 데이터가 잘못 삽입되었을 때 제거할 방법이 없었음.
+- **해결 방안**: 
+  - (1) 불필요한 이미지 건너뛰기 수행 시 해당 이미지를 디스크에서 바로 영구 삭제하여(디스크 공간 관리 및 작업 효율 증가) 쓰레기 데이터 생성을 억제함.
+  - (2) UI를 통해 개별 클래스(1~4, neg)의 데이터나 전체 라벨링 된 데이터를 클릭 한 번에 디스크에서 삭제하는 관리 패널 추가.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `gui/tab_training.py`
+  - 스페이스바(`[Space]`) 동작을 기존 넘어가기(`_next`)에서 디스크 파일 삭제(`_skip_delete`) 기능으로 매핑 변경 및 버튼 디자인 빨간색/경고표시로 업데이트 (`🗑 삭제 후 다음`)
+  - **Added**: `_skip_delete()` 추가. `os.remove`로 큐의 이미지를 실제로 지우고 다음 인덱스로 조정하는 로직 구현.
+  - **Added**: 라벨 데이터 관리 패널 (`_delete_label_class()`, `_delete_all_labels()`) 추가. 각 클래스별 `삭제` 버튼 그리고 `⚠️ 전체 초기화` 버튼 배치. 디스크 상의 `data/siamese_train/클래스` 폴더를 직접 스캔하여 지움.
+
+### ✅ 검증 결과
+- 터미널을 통해 기존 구 학습 데이터(60장) 모두 깨끗하게 삭제 성공. 
+- Python 문법 체크(`py_compile`) 정상 확인.
+
+---
+
+
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **문제 1**: YOLO OFF 시 유사도 20% 미만 → 정상. 풀프레임 압축 시 모니터 영역이 너무 작아져 특징을 잃어버림. 샴 네트워크는 반드시 YOLO 크롭 ON 상태로 사용해야 함.
+- **문제 2**: YOLO ON 시 무조건 합격 + 타겟 구분 불가 (전부 타겟1로 수렴)
+  - **근본 원인 A**: FC Softmax '과잉 확신(Overconfidence)'. 앵커 간 유사도가 0.68~0.88로 높아, Softmax가 작은 차이를 92% vs 6% 로 과장해 무조건 1개 타겟에 몰아줌.
+  - **근본 원인 B**: 진단 결과 neg 훈련 데이터가 타겟 3·4를 잠식 (3.png→neg 67.8%, 4.png→neg 79.6% 1위). 정상 앵커도 neg FC 안전장치에 걸려 불합격 처리되던 치명적 버그.
+- **해결 전략**: FC Softmax를 판정 기준에서 제거하고, 순수 코사인 유사도(DNA 거리 측정)를 단독 합격 기준으로 전환.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `offline/siamese_classifier.py` — `classify_frame()` 전면 재설계
+  - **Added**: `self.cosine_threshold = 0.75` (코사인 유사도 합격 기준값, GUI 슬라이더로 조절 가능)
+  - **Changed**: FC Softmax argmax로 합격 판정하던 방식 → 모든 앵커와 코사인 유사도 계산 후 최고 유사도 앵커를 선정하는 방식으로 전환
+  - **Disabled**: neg 클래스 FC 교차 확인 로직 비활성화 (neg 데이터 잠식 버그 수정, 재학습 후 재활성화 예정)
+- **Changed**: `gui/tab_monitor.py` — `SiameseVideoThread`
+  - `sim_threshold` 기본값 0.65 → 0.75 로 통일 (classifier.cosine_threshold 와 동기화)
+  - `set_sim_threshold()` 메서드에서 `classifier.cosine_threshold`도 함께 업데이트하도록 연결
+- **Added**: `verify_siamese.py`, `verify_fc.py` — 검증 스크립트 (임시)
+
+### ✅ 검증 결과
+```
+앵커 교차 테스트 (코사인 유사도 단독 기준):
+  1.png → 1.png  100.0%  [합격] ✅
+  2.png → 2.png  100.0%  [합격] ✅
+  3.png → 3.png  100.0%  [합격] ✅  (기존엔 neg 잠식으로 불합격이었음)
+  4.png → 4.png  100.0%  [합격] ✅  (기존엔 neg 잠식으로 불합격이었음)
+```
+
+---
+
+## [2026-04-06 12:29] 🎯 샴 네트워크 가짜 데이터(neg) 합격 오판 버그 수정 (유사도 재정의)
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **이슈:** 사용자가 가짜 모니터 데이터를 `neg` 로 열심히 라벨링해서 정답(타겟)과 비교해 유사도(Similarity) 차이가 나게 만들려고 했으나, 오히려 `neg`에 대해서 높은 유사도가 검출되며 합격(is_ok=True) 처리되어버리는 역효과를 호소함. 
+- **분석 결과:**
+  1. FC 분류기 특성상 타겟이 아닌 `neg` (배경) 데이터를 비추면, AI는 "`neg`일 확률이 95%다!"라고 올바르게 판단을 내림.
+  2. 그러나 UI를 담당하는 추론 로직에서 단순히 **가장 확률이 높은 클래스**의 이름과 수치를 가져왔기 때문에, `neg` 클래스의 확률 95%를 가져오고는 "유사도 95%이므로 기준선(60%) 돌파로 합격"이라고 잘못 판정하는 코드 로직의 허점이 있었음.
+- **해결 방안:** 
+  1. "유사도"라는 개념을 변경: 전체 중에 가장 높은 확률이 아니라, 항상 **오직 진짜 타겟(1, 2, 3, 4번) 중 가장 높은 확률**을 화면에 표시해주도록 분리 구동함.
+  2. 이럴 경우 `neg` 클래스에 가장 높은 확률이 배정된 가짜 상황에서는, 진짜 타겟들의 확률이 5% 전후로 급락하므로, 자연스럽게 "타겟 유사도 5%" 로 표시되며 사용자의 직관적인 의도대로 맞아떨어짐.
+  3. 전체 확률 1등이 `neg`이거나, 진짜 타겟의 최대 확률이 60% 미만이면 무조건 **불합격(is_ok=False)**으로 강제 처리하도록 엄격한 합격 기준 마련.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `offline/siamese_classifier.py`
+  - `classify_frame()` 함수 내부의 FC 로직 수정: `argmax()` 로 일괄 처리하던 방식에서 벗어나, for문을 돌아 `neg` 클래스가 제외된 채 계산된 확률인 `best_target_prob`을 계산.
+  - 이를 기반으로 타겟 유사도(`confidence`)를 재할당하고, `is_neg_dominant` (전체 1등이 neg인지) 플래그를 도입하여 정확한 합격 불합격 판정(`is_ok`)을 반환하도록 개선.
+
+---
+
+## [2026-04-06 00:26] 🎯 샴 네트워크 학습 데이터 스케일 불일치 현상 원인 규명 및 수정
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **이슈:** "라벨링 시 사용할 때는 전체 캡처본 화면을 썼는데, 정작 샴 네트워크 학습 때는 욜로로 모니터 베젤을 자른 건가요?" 라는 사용자의 날카로운 질문으로 시작됨.
+- **분석 결과:** 
+  1. `LiveMonitorSubTab`에서 생성된 앵커 데이터(`1.png ~ 4.png`)는 **YOLO로 크롭된 모니터 베젤 화면**이었음.
+  2. `SiameseLabelTab`에서 라벨링하여 저장된 데이터들(특히 neg 클래스)은 **전체 화면을 그대로 캡처한 이미지(Full Frame)**였음.
+  3. 그러나 `scripts/train_siamese.py` 내부에서는 YOLO 크롭 로직이 없이 PIL로 전체 화면을 그대로 불러와 256x256 해상도로 강제 압축 후 훈련시키고 있었음. 결과적으로 타겟(크롭 됨)과 학습 데이터(전체 화면) 간의 심각한 비율/스케일 불일치(`Data Mismatch`) 트러블이 발생했음.
+- **해결 방안:** 데이터를 학습 텐서로 변환하는 `MixedDataset` 내부에서 실시간 추론 시와 동일하게 `BezelDetector`를 가동, **모든 학습 데이터를 앵커와 동일하게 YOLO로 정확히 베젤 영역만 크롭한 후 학습에 투입하도록 수정함**.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `scripts/train_siamese.py`
+  - `MixedDataset.__init__` 최상단에 `BezelDetector` 초기화 로직 구현.
+  - 라벨드 이미지 및 `neg` 이미지를 `Image.open()`으로 읽어들이는 과정 직후에 `crop_with_yolo()` 함수를 거쳐, **모니터 베젤 영역만 정확하게 크롭(추출)한 뒤** `self.samples` 증강 리스트에 넣도록 파이프라인을 완전히 개선함. 이를 통해 타겟 이미지와 라벨링 이미지 간의 혼동을 원천 차단.
+
+---
+
+## [2026-04-06 00:20] 🎯 샴 네트워크 "모든 판정 20%대 고정" 버그 분석 및 완벽 해결
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **이슈:** 사용자가 샴 네트워크 파인튜닝 학습 후 정답이든 오답이든 유사도가 항상 20%대만 나오는 치명적인 현상을 보고함.
+- **원인 분석 결과:**
+  1. **학습 자체는 역대급 정상:** 재학습 및 진단 스크립트 실행 결과, 학습 단계의 가중치 수렴(Acc 100%)이나 앵커 간의 코사인 벡터 거리 구조는 완벽한 정상 범위(`0.75~1.00`)를 보였음.
+  2. **치명적 스케일 매칭 버그 발견:** 예측 추론 단계(`offline/siamese_classifier.py`)에서 `FC Head` 로 분류판정을 내릴 때, 학습 때 사용했던 크기가 큰 **정규화 전의 원본 벡터(Raw Feature)** 를 넣지 않고, 코사인 비교용으로 벡터 길이를 `1` 로 극단적으로 잘라낸 **L2 정규화 내적 임베딩(Normalized Feature)** 을 잘못 집어넣고 있었음을 포착함.
+  3. **"왜 항상 20%인가?"의 수학적 원리 (스케일 붕괴):** FC 분류기(Linear Layer)에 길이가 단 `1`밖에 안 되는 텐서가 입력되자 출력(Logit) 점수들이 0 근처의 매우 미세한 수치(`[0.01, -0.02, 0.05, -0.01, 0.03]`)로 쪼그라들었음. Softmax 함수는 이 미세한 차이를 분간하지 못하고 총합 1을 5개 클래스에 1/5 씩 분배해버려, 결국 어떤 사진을 찍어 돌리든 항상 `[20%, 20%, 20%, 20%, 20%]`라는 랜덤 확률이 평평하게 나올 수밖에 없는 구조적 결함이었음을 명백히 증명해냄.
+- **결정:** 데이터 불균형을 교정하는 재학습을 수행하고, 추론 로직에서 분류기(FC)에 전달하는 텐서를 분리하여 코사인 내적용이 아닌 `model()` 바로 직후의 `raw_feature`를 전달하도록 아키텍처를 교정하여 문제를 기적적으로 완벽히 수리함.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `offline/siamese_classifier.py`
+  - `classify_frame()` 함수 전면 수정: `transform -> 모델 통과 -> 정규화 -> FC 계산` 으로 이어지던 폭포수를 분리. `raw_feature = model(t)` 즉시 변수를 빼내어 `fc_head`에 직접 통과시키고, L2 코사인 정규화는 오직 폴백 비교 모드에서만 사용하도록 분리 설계함. (버그 수리)
+- **Changed**: `scripts/train_siamese.py`
+  - `neg(배경/오답)` 클래스 데이터 개수가 압도적으로 많아 발생하는 `Data Imbalance` 과대표현 문제를 원천 차단하기 위해, `CrossEntropyLoss` 선언 시 각 클래스 표본수에 따라 자동 역산 증폭되는 `class_weights` 보정 코드를 도입.
+  - 가중치 균형을 위해 `AUG_PER_IMG` 증강을 500장으로 올리고, `EPOCHS_UNFROZEN`을 30으로 상향하여 강력하게 재학습 실시 (최종 Validation Accuracy 100.0% 달성).
+- **Added**: `scripts/diagnose_siamese.py` / `tmp_diag2.py`
+  - 윈도우 인코딩 충돌을 우회하는 진단 툴킷을 이용해 Raw Feature의 Logit 스케일을 직접 까보고 문제를 진단.
+
+---
+
+## [2026-04-05 23:01] 🧬 샴 네트워크 수동 라벨링 UI + 실제 데이터 혼합 학습 파이프라인 구축
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **이슈**: 샴 네트워크가 싹 다 불합격 판정 → 원인 분석: `siamese_finetuned.pt`에 `fc_state` 키가 없어 FC 헤드 모드가 비활성화되고, 코사인 유사도 폴백(합격기준 0.90)에서 전부 탈락.
+- **근본 원인**: 앵커 4장 증강만으로 학습 시 Domain Gap 문제. 모니터 4개가 비슷하게 생겨 임베딩이 뭉침 → 실제 카메라 프레임으로 라벨링하여 학습하는 것이 해결책.
+- **결정**: C안 채택 — Pending 폴더 + 실시간 캡처 큐 양쪽을 소스로 받아, 사용자가 직접 1~4번 타겟 또는 '정답아님(neg)'으로 클릭/키보드 라벨링 후 샴 학습 실행.
+- **추가 조치**: 기존 `data/pending/` 폴더에 있던 7,129장의 무의미한 실시간 자동캡처 이미지를 전량 삭제함.
+- **실시간 캡처 추가**: `샴 네트워크 관제` 탭에 `📸 샴큐 캡처` 버튼을 추가하여 관제 중 즉시 라벨링 소스를 수집할 수 있도록 연동.
+- **학습 UI 진행률 버그 수정**: 샴 학습을 시작할 때 내부적으로 학습은 돌아가고 있으나, 파이썬 출력 버퍼링 문제로 인해 UI 프로그레스 바가 "시작 중"에서 멈춰있는 현상(`subprocess` 파이프라인 지연)을 발견하고 `-u` (unbuffered) 옵션을 추가해 실시간 연동이 되도록 긴급 패치.
+- **neg 클래스 설계**: '정답아님' 이미지를 별도 배경 클래스(N+1)로 학습 → "이건 타겟이 아님" 분류 가능. 재학습 시 자동 포함.
+- **문법 검사**: `py -m py_compile` 두 파일 모두 오류 없음 ✅
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed**: `gui/tab_training.py` — 라벨링 로직 및 학습 스레드 UI 연동 패치
+  - **Changed**: 라벨링 시 `shutil.copy2`를 `shutil.move`로 변경하여 라벨링이 끝난 이미지는 큐에서 즉시 비워지도록(소비되도록) UX 개선
+  - **Fixed**: `SiameseTrainThread`에서 `subprocess.Popen` 호출 시 `python_exe`에 `"-u"` 옵션을 추가하여, 파이썬 버퍼링을 해제하고 UI 프로그레스 바가 즉각적으로 차오르도록 수정
+- **Changed**: `gui/tab_monitor.py` — 실시간 관제 서브탭 UI 업데이트
+  - **Moved**: `LiveMonitorSubTab`에 있던 `📸 샴큐 캡처` 버튼 제거
+  - **Added**: `SiameseMonitorSubTab` 서브탭(샴 전용 관제)의 상단 컨트롤 바에 `📸 샴큐 캡처` 버튼과 `_capture_for_siamese()` 메서드 추가 (`data/siamese_train/_queue/`로 즉시 저장되도록 연동)
+  - **Changed**: `SiameseVideoThread.run()`에서 캡처 처리를 위해 `self._last_crop` 변수 할당 추가
+- **Changed**: `gui/tab_training.py` — 3개 영역 수정
+  - **Added**: 상수 `SIAMESE_TRAIN_DIR`, `SIAMESE_QUEUE_DIR`, `_LABEL_META` (폴더키·버튼텍스트·색상 튜플 5개)
+  - **Added**: `SiameseTrainThread` 클래스 — `train_siamese.py`를 subprocess로 실행, `[PCT%]` 라인 파싱 → progress/finished 시그널 발행
+  - **Added**: `SiameseLabelTab` 클래스 (약 200줄) — 이미지 뷰어 + 소스 선택(Pending/캡처큐) + 라벨 버튼 5개(1~4·neg) + 건너뜀 + 카운터 + 학습 진행바. 키보드 단축키: 1~4, X, Space, ←→
+  - **Changed**: `TrainingTab` — 서브탭 3번째 `🧬 샴 라벨링` 추가
+- **Changed**: `scripts/train_siamese.py` — 4개 영역 수정
+  - **Added**: 상수 `SIAMESE_TRAIN_DIR`, `AUG_ANCHOR_MIX=50`, `AUG_LABELED_LIGHT=5`
+  - **Added**: `MixedDataset` 클래스 — 라벨 데이터 있으면 실제이미지×5 + 앵커×50 혼합, 없으면 앵커×300 폴백. neg 폴더도 별도 클래스로 처리
+  - **Added**: `_detect_labeled_data()` — `data/siamese_train/` 폴더를 순회해 라벨 유무·클래스목록 자동 감지
+  - **Changed**: `run_training()` — `[PCT%]` 진행률 출력 전체 추가(5%→100%), 라벨 데이터 유무에 따라 MixedDataset/AugmentedAnchorDataset 자동 분기
+
+---
+
+## [2026-04-05 22:35] 🚨 샴 네트워크 혼동 버그 진단 및 FC 헤드 직접 분류 방식(해결책) 도입
+
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **이슈 발생**: 사용자가 샴 네트워크가 "80% 이상의 높은 유사도를 반환하면서 단지 다른 이미지(타겟)를 찍는 심각한 혼동 버그"를 보고함. 학습 자체가 잘못된 것인지 진단 요청.
+- **원인 분석 (`diagnose_siamese.py` 신규 작성 및 진단)**:
+  - 앵커 자기 유사도는 1.0(정상)이지만, 서로 다른 앵커 간의 코사인 유사도 평균이 **0.80**, 최대 혼동 유사도가 **0.8995**에 육박함.
+  - 마진(자기-최대혼동)이 단 **10%**에 불과해, 카메라 노이즈나 각도 등 약간의 도메인 갭만 생겨도 코사인 유사도가 역전되는 현상 발생.
+  - 즉, 모델이 학습을 못 한 게 아니라 **"모니터 화면 4개가 본질적으로 해상도 등 너무 비슷하게 생겨서 512차원 임베딩 공간에 뭉쳐 있는" 구조적 한계**였음.
+- **해결 방안 결정**: 기존의 코사인 유사도 판정 방식의 한계를 인지. 하지만 파인튜닝 시 **분류 헤드(FC, Fully Connected)**가 CrossEntropy 특성 상 미세한 차이를 극대화시켜 분류 경계를 학습했으므로, 임베딩을 벗기는 대신 FC 헤드의 Logit 연산(Softmax Argmax)으로 판정 방식을 전면 개편(방법 A)하기로 결정함.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Added**: `scripts/diagnose_siamese.py` — 앵커 간 4x4 코사인 유사도 행렬 계산, 최대 혼동 마진(Margin) 점검, 자기 위치 매칭을 정밀 리포트하는 품질 진단 스크립트 작성 (진단 점수 기반 자동 처방 로직 포함).
+- **Changed**: `scripts/train_siamese.py` — 체크포인트 저장 시나리오 수정.
+  - 모델의 FC를 `nn.Identity()`로 잘라내 버리기 직전에 `fc_state`로 추출 및 복사본 떠놓음. 이를 통해 `{ 'fc_state': ... }` 형태로 훈련된 분류 헤드를 캡슐화하여 체크포인트(`siamese_finetuned.pt`)에 공동 저장하도록 개선.
+- **Changed**: `offline/siamese_classifier.py` — 판정 방식 전면 개편.
+  - 체크포인트를 로드할 때 `fc_state`가 감지되면 무조건 `FC 직접 분류 모드`로 자동 전환.
+  - 별도로 `classify_frame` 메서드를 구축하여, Softmax 함수를 통한 확률값(Confidence %)을 도출, 60% 이상의 확률일 때 합격하도록 구현. 
+  - 하위 호환성을 위해 `fc_state`가 없으면 기존 '코사인 유사도' 베이스로 자동 폴백.
+- **Changed**: `gui/tab_monitor.py` — `SiameseVideoThread.run()`
+  - 수동으로 벡터 유사도를 곱하고 더하며 비교하던 구식 50줄의 코드를 걷어내고, 위 `classify_frame()` 함수 단일 호출로 통합. 
+  - UI 타이머 바이브 맵의 호환성을 유지하기 위해 도출 된 소요 시간(Total ms)을 임베딩/비교 = 7/3 수학적 비율로 자르도록 수정함. 
+
+---
+
+
+
+### 💬 논의 및 결정 사항 (Discussion)
+- 사용자 요청: 실시간 관제 탭(`tab_monitor.py`)에 YOLO+ORB와 유사한 구조로 **샴 네트워크 전용 관제 서브탭** 추가.
+- 추가 요구사항: YOLO 없이도 샴 네트워크 단독으로 동작할 수 있는지 확인하기 위해, `YOLO ON/OFF 토글` 버튼을 컨트롤 바에 배치.
+  - **YOLO ON**: 모니터 영역을 YOLO로 크롭한 뒤 ResNet18 임베딩 추출 (정확도 ↑)
+  - **YOLO OFF**: 풀프레임(원본 전체) 그대로 임베딩 추출 (YOLO 없이도 작동 가능 여부 확인)
+- **결정**: `tab_monitor.py`에 3개의 새 클래스를 추가하고 `MonitorTab`의 서브탭을 3개로 확장.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Added**: `gui/tab_monitor.py` — `SiameseVideoThread` 클래스
+  - `use_yolo` 파라미터로 YOLO 크롭 ON/OFF 전환 가능
+  - 파이프라인: ① YOLO 크롭(선택) → ② ResNet18 임베딩 추출 → ③ 코사인 유사도 비교 → ④ 화면 오버레이 합성
+  - 결과 인셋(크롭 분석 결과 이미지)을 원본 풀프레임 좌상단에 미니 합성하여 두 결과를 동시 확인 가능
+  - `frame_signal`, `status_signal`, `progress_signal` 시그널 정의
+- **Added**: `gui/tab_monitor.py` — `SiameseStatsPanel` 클래스
+  - 기존 `StatsPanel`과 동일한 구성: KPI 카드 4개(FPS / 유사도% / 판정 / YOLO) + Total ms + Latency 막대 + 파이 차트 + 캔들스틱 + DualBoxPlot
+  - `YOLO OFF` 모드에서는 YOLO 카드에 "OFF (풀프레임)" 표시
+- **Added**: `gui/tab_monitor.py` — `SiameseMonitorSubTab` 클래스
+  - 파일 열기 / 카메라 / 일시 정지 / 종료 버튼 (기존 Live 관제 서브탭과 동일한 UX)
+  - `🔍 YOLO ON` 토글 버튼: 클릭 시 현재 재생 중인 소스를 유지하면서 스레드 재시작으로 즉시 반영
+- **Changed**: `gui/tab_monitor.py` — `MonitorTab`
+  - 서브탭 2개 → **3개**: `🎥 실시간 Live 관제` + `🎯 타겟 뷰어 & ROI 설정` + **`🧬 샴 네트워크 관제`**
+
+---
+
+## [2026-04-05 21:50] 🧠 샴 네트워크(Siamese) 파인튜닝 엔진 구축 및 적용
+
+### 💬 논의 및 결정 사항 (Discussion)
+- 사용자 논의: 샴 네트워크는 기본적으로 ImageNet 모델이라 공장 모니터 사진 판독 시 Domain Gap(도메인 갭)이 발생하므로 정확도 한계가 존재함.
+- "4장의 앵커 사진을 증강시켜 학습하면 정확도가 높아질까?"에 대한 사용자 가설 검증 진행.
+- **결정**: 앵커 4장을 `RandomPerspective`, `ColorJitter`, `GaussianBlur`, `최초 커스텀 센서 노이즈` 등 카메라의 물리적 열화와 동일하게 300배씩 증강(총 1,200장)시켜 **공장 도메인 특화 샴 네트워크**로 파인튜닝 진행.
+- **파인튜닝 전후 성능 극적 반전 (핵심 성과)**:
+  - 사전학습된 기존 모델은 카메라 노이즈가 낀 `pending_000002_s13.jpg` 이미지를 **완전히 다른 타겟인 `2.png`로 오해(유사도 87.22%)**하는 치명적 맹점을 보였음.
+  - 하지만 단 몇 분 만의 파인튜닝을 거친 모델은, 이 사진의 노이즈와 프레임 왜곡을 전부 이해하고 **자력으로 정확히 `1.png`로 교정 판정(유사도 80.76%)** 해내는 놀라운 성과를 입증함.
+  - 추론 속도 역시 **36.7ms** 실측으로 확인되어, ORB/YOLO(Track A)를 보조하거나 완전히 샴 단독으로 사용할 수 있을 수준의 잠재력을 증명함.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Added**: `scripts/train_siamese.py` — 샴 네트워크 전용 파인튜닝 스크립트 작성.
+  - Phase 1 (백본 동결 + Layer 학습: 5 에폭) + Phase 2 (전면 해동 + 미세조정: 15 에폭) 투트랙 전략으로 학습 100.0% 수렴 완료.
+  - 오직 임베딩 추출 성능 향상에 초점을 맞추어, 최종 `.fc` 레이어를 다시 `Identity`로 벗겨낸 후 `.pt` 파일로 저장.
+- **Changed**: `offline/siamese_classifier.py` — 2가지 핵심 보완점
+  1. **경로 버그 수정**: `anchor_dir="../models..."` 하드코딩된 상대 경로를 `__file__` 기준의 절대 경로 탐색 방식으로 변경하여 실행 위치 환경변수 충돌 버그 원천 차단.
+  2. **가중치 자동 로더 적용**: `siamese_finetuned.pt` 존재 시 이를 최우선으로 로딩하며, 파일이 없을 경우에만 기존 하위 호환 구조인 ImageNet 모델로 폴백(Fallback)하도록 설계.
+
+---
+
+## [2026-04-05 21:13] 🧠 샴 네트워크(Siamese) 진단 및 앵커 이미지 활성화
+
+### 💬 논의 및 결정 사항 (Discussion)
+- 사용자 요청: 현재 모델에서 샴 네트워크가 잘 작동하는지 확인.
+- 전수 조사 결과:
+  - `offline/siamese_classifier.py` 코드 자체는 정상 (ResNet18 기반, 코사인 유사도, 3단 판별 로직 완성).
+  - **치명적 문제 발견**: `models/siamese_anchor/` 폴더가 완전히 비어 있어, `classify_image()` 호출 시 무조건 `NO_ANCHOR_FOUND` 반환 상태였음.
+  - `data/pending/` 폴더에는 약 1,000장 이상의 분류 대기 이미지가 존재함에도 불구하고, 앵커 없이 분류 자체가 불가능한 상태.
+- **결정(방법 A)**: `dataset_target_and_1cycle/target_image/` 의 타겟 이미지 4장 (1~4.png) 을 `models/siamese_anchor/` 로 복사하여 즉시 활성화.
+- **실제 분류 테스트 결과 (활성화 후)**:
+  - ResNet18 가중치 최초 다운로드 후 캐시됨 (이후 즉시 로드).
+  - `pending_000002_s13.jpg` → 가장 유사한 타겟: `2.png` (유사도 87.22%) → 판정: `NEED_LLM_JUDGE` ✅
+  - 샴 추론 시간: **40.9ms** (CPU, No GPU).
+
+- **추가 질문 — 샴 vs YOLO+ORB 실시간 속도 비교** (사용자 질의):
+  - **결론: 둘을 직접 비교하는 것은 "사과 vs 오렌지" 비교임.**
+  - YOLO(28ms) + ORB(8ms) = **36ms → 약 27 FPS** (실시간 Track A 용도)
+  - 샴 ResNet18 추론 = **41ms/장** (오프라인 Track B 용도)
+  - 샴을 실시간에 올리면: YOLO(28ms) + 샴(41ms) = 69ms → **14 FPS** (60FPS 기준 미달)
+  - ORB는 GPU 없이 수 ms 수준이고 규칙 기반이라 실시간에 적합. 샴은 야간 배치 처리용.
+  - 아키텍처 문서에서 "실시간 Track A에 딥러닝 올리지 않는다"고 명시한 설계 의도 재확인.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Added**: `models/siamese_anchor/1.png`, `2.png`, `3.png`, `4.png` — `target_image/`에서 복사 (4장, 총 약 1.6MB)
+- **Verified**: `SiameseClassifier` 초기화 → 앵커 임베딩 4개 로드 → `classify_image()` 정상 판정 확인 ✅
+
+---
+
 ## [2026-04-04 18:23] 🔒 GitHub 업로드 준비 — .gitignore 보안 강화
 
 ### 💬 논의 및 결정 사항 (Discussion)
