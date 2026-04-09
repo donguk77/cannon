@@ -1,3 +1,146 @@
+## [2026-04-09 26:00] 📚 APK 트러블슈팅 참조 문서 신설
+
+### 💬 논의 및 결정 사항
+- **요청**: 이번 세션에서 발생한 APK 빌드·카메라 문제와 history.md의 기존 사례들을 별도 참조 문서로 정리. 향후 유사한 문제가 생겼을 때 빠르게 참조하고 같은 실수를 반복하지 않도록.
+- **결정**: `docs/apk_troubleshooting.md` 신설. Claude가 미래 세션에서 참조하는 용도로, 원인·해결·교훈 위주로 구성.
+
+### 🛠️ 코드 수정 내역
+- **Added**: `docs/apk_troubleshooting.md`
+  - 현재 프로젝트 고정값 표 (버전, 패치 파일, 플러그인 목록)
+  - EAS 빌드 실패 6종 케이스 (expo-build-properties / Kotlin 컴파일 / Gradle 버전 / packageName / VisionCamera 비호환 / Maven 429)
+  - Maven Central 429 삽질 기록 — 1·2차 실패 원인 포함, includeBuild 구조 설명
+  - 카메라 버그 3종 케이스 (권한 후 device undefined / 깜빡임 / showResult 항상 false)
+  - 빌드 전 체크리스트, VisionCamera 업그레이드 주의사항
+
+---
+
+## [2026-04-09 25:00] 🎥 슬라이드쇼 → 부드러운 영상 + zombie stabilize 오버레이
+
+### 💬 논의 및 결정 사항
+- **문제**: 라이브 영상이 영상처럼 보이지 않고 사진 나열처럼 끊겨 보임. PASS/FAIL 배지·폴리곤이 전혀 표시되지 않음.
+- **원인 1**: `showResult = isConnected && !!result?.frame` — 서버가 `frame` 필드를 보내지 않으므로 항상 `false`. `OverlayView`에 항상 `result=null`이 전달되어 오버레이 완전 비활성화.
+- **원인 2**: 오버레이가 없으니 `takeSnapshot()` 200ms 호출 시 일부 기기에서 프리뷰가 끊겨 슬라이드쇼처럼 보임.
+- **요청**: 1프레임을 보내고 ~100ms 후 결과가 오면, 다음 프레임을 보낼 때까지(~100ms) 이전 결과 오버레이를 그대로 유지(zombie stabilize)하여 영상처럼 보이도록.
+- **결정**: `showResult` 제거, `overlayResult = isConnected ? result : null`로 교체. 서버 결과 Image 오버레이 제거(서버가 frame을 안 보내므로 불필요). OverlayView가 항상 실제 result를 받도록 수정.
+
+### 🛠️ 코드 수정 내역
+- **Changed**: `connect_phone/mobile/src/screens/CameraScreen.tsx`
+  - `showResult = isConnected && !!result?.frame` 제거
+  - `overlayResult = isConnected ? result : null` 추가 (zombie stabilize)
+  - `<Image source={{ uri: ...result.frame... }}>` 블록 제거 (서버가 frame 미전송)
+  - `import Image` 제거 (미사용)
+  - `<OverlayView result={showResult ? result : null}>` → `<OverlayView result={overlayResult}>` 교체
+  - 실시간 모드 대기 안내 조건: `!streaming && !showResult` → `!streaming`
+
+### 📝 zombie stabilize 동작 흐름
+```
+t=0ms     : 프레임 전송 → 라이브 카메라 표시 (30fps 부드러운 영상)
+t=100ms   : 결과 수신  → overlayResult 업데이트 (폴리곤/배지 갱신)
+t=100~200ms: 라이브 카메라(계속 부드럽게) + 이전 결과 오버레이 zombie 유지
+t=200ms   : 다음 프레임 전송 → overlayResult 그대로 유지 (깜빡임 없음)
+t=300ms   : 새 결과 수신 → overlayResult 갱신
+```
+
+### 🐛 시행착오
+| 문제 | 원인 | 해결 |
+|------|------|------|
+| 오버레이 전혀 표시 안 됨 | 서버가 `frame` 필드를 안 보내는데 `result?.frame`으로 체크 → 항상 `false` | `showResult` 제거, `overlayResult = isConnected ? result : null` |
+| 서버 응답 타입 불일치 | `MatchResult` 타입에 `frame` 없음에도 `result!.frame` 접근 | Image 블록 제거, 타입 불일치 해소 |
+
+### ⚠️ 교훈
+- **서버가 반환하는 JSON 필드**: `status, target_id, score, roi_passed, roi_total, corners, processing_ms, yolo_hit` — **`frame` 없음**
+- 서버 응답 구조가 바뀌면 클라이언트의 display 조건도 반드시 같이 확인할 것
+
+---
+
+## [2026-04-09 24:00] 🔧 EAS 빌드 연속 실패 — Maven Central 429 근본 수정
+
+### 💬 논의 및 결정 사항
+- **문제**: EAS 빌드 서버 IP가 Maven Central(`repo.maven.apache.org`)에 rate limit(HTTP 429)를 받아 `kotlin-native-utils:1.9.24` 등 다운로드 실패. 3회 연속 빌드 실패.
+- **삽질 과정**:
+  - 1차: `withMavenRepositories.js`로 메인 `android/settings.gradle` 수정 → 틀린 파일(includeBuild 내부가 문제)
+  - 2차: `patch-package`로 `expo-gradle-plugin/settings.gradle.kts`에 `cache-redirector.jetbrains.com/maven-central` 추가 → URL 자체가 틀림 (JetBrains 내부 CDN, 외부 접근 불가 → 404 → 에러 로그에 아예 안 나타남)
+  - 3차 성공: `repo1.maven.org/maven2/`(Sonatype 원본 서버) + init script 이중 적용
+- **추가**: TypeScript `5.3.3` → `5.9.2` 업데이트 (expo doctor 경고 해소)
+
+### 🛠️ 코드 수정 내역
+- **Changed**: `patches/expo-modules-autolinking+3.0.24.patch` (신규 생성 후 URL 수정)
+  - `expo-gradle-plugin/settings.gradle.kts` — pluginManagement.repositories에 `repo1.maven.org/maven2/` 추가
+  - `expo-autolinking-plugin-shared/build.gradle.kts` — repositories에 `repo1.maven.org/maven2/` 추가
+- **Added**: `plugins/withGradleInit.js`
+  - prebuild 시 `android/maven-mirrors.init.gradle` 생성
+  - `gradlew`에 `--init-script "$APP_HOME/maven-mirrors.init.gradle"` 플래그 주입
+  - `gradle.beforeSettings` 훅 → main build + 모든 includeBuild에 미러 적용
+- **Changed**: `plugins/withMavenRepositories.js` — URL `cache-redirector.jetbrains.com` → `repo1.maven.org/maven2/` 교체
+- **Changed**: `connect_phone/mobile/package.json` — `typescript: "~5.3.3"` → `"5.9.2"`
+- **Changed**: `connect_phone/mobile/package-lock.json` — `npm install`로 재생성
+
+### 📝 includeBuild 구조 이해 (핵심)
+```
+메인 android/settings.gradle
+    └── includeBuild(expo-gradle-plugin)  ← 독립 실행됨
+            └── expo-gradle-plugin/settings.gradle.kts  ← 자체 repositories
+                    └── expo-autolinking-plugin-shared/build.gradle.kts  ← 자체 repositories
+```
+- 메인 settings.gradle은 includeBuild 내부에 영향을 주지 않는다
+- 각 포함된 빌드가 자신의 settings 파일을 독립적으로 사용한다
+- init script(`--init-script` 플래그)는 모든 빌드에 전파되어 유일한 글로벌 진입점
+
+### 🐛 시행착오
+| 시도 | 무엇을 했나 | 실패 이유 |
+|------|------------|---------|
+| 1차 | 메인 `android/settings.gradle` 수정 | includeBuild 내부에는 영향 없음 |
+| 2차 | `cache-redirector.jetbrains.com` 미러 | JetBrains 내부 CDN → 외부 404 → 에러 로그에 안 나타남 |
+| 3차 | `repo1.maven.org/maven2/` + init script | 성공 |
+
+### ⚠️ 교훈
+- `repo.maven.apache.org` = Apache 미러, rate limit 걸리는 서버
+- `repo1.maven.org/maven2/` = Sonatype 원본, 다른 인프라 → 429 우회 가능
+- `cache-redirector.jetbrains.com` = 내부용, 외부 접근 불가 → 사용하지 말 것
+- Maven 429 발생 시 `docs/apk_troubleshooting.md` 참조
+
+---
+
+## [2026-04-09 23:00] 📱 카메라 권한 승인 후 device undefined 고정 버그 수정
+
+### 💬 논의 및 결정 사항
+- **문제**: APK 설치 후 앱 시작 시 "카메라를 찾을 수 없다"며 시작부터 동작하지 않음.
+- **원인**: `useCameraDevice('back')` 훅은 마운트 시점에 `Camera.getAvailableCameraDevices()`를 동기 호출한다. 이때 카메라 권한이 없으면 빈 배열 → `device = undefined`. 권한 승인 후 `CameraDevicesChanged` 이벤트가 **일부 Android 기기에서 발화되지 않아** `device`가 영구적으로 `undefined` 상태 유지 → 무한 스피너.
+- **결정**: `CameraScreen`을 권한 가드(CameraScreen)와 실제 UI(CameraContent)로 분리. `useCameraDevice`가 권한이 있는 상태에서만 초기화되도록 보장.
+
+### 🛠️ 코드 수정 내역
+- **Changed**: `connect_phone/mobile/src/screens/CameraScreen.tsx`
+  - `CameraScreen` (default export): 권한 가드 역할. `hasPermission`이 `false`면 권한 요청 화면. `true`면 `CameraContent` 마운트.
+  - `CameraContent` (내부 함수): 실제 카메라 UI. `useCameraDevice` 훅이 이 컴포넌트 안에서 호출되어 항상 권한 있는 상태에서 초기화됨.
+  - `deviceKey` 상태: 재시도 시 강제 리마운트용
+  - `deviceTimeout` 상태: 8초 후 에러 메시지 + "다시 시도" 버튼 표시 (무한 스피너 방지)
+  - `msgSub` 스타일 추가
+
+### 📝 구조 변화
+```tsx
+// 이전: 한 컴포넌트 안에서 권한 체크 + useCameraDevice 모두 처리
+// → 권한 없는 상태에서 useCameraDevice가 호출되어 device=undefined 고정
+
+// 이후: 분리
+export default function CameraScreen(...) {
+  const { hasPermission } = useCameraPermission();
+  if (!hasPermission) return <PermissionScreen />;
+  return <CameraContent />;  // ← 권한 확인 후에만 마운트
+}
+
+function CameraContent(...) {
+  const device = useCameraDevice('back'); // 항상 권한 있는 상태에서 초기화
+}
+```
+
+### 🐛 시행착오
+| 문제 | 원인 | 해결 |
+|------|------|------|
+| 권한 승인 후에도 device=undefined | `CameraDevicesChanged` 이벤트 미발화 (Android 일부 기기) | 권한 확인 후 컴포넌트 마운트하여 초기화 시점 보장 |
+| 무한 스피너 | device가 undefined 상태에서 Activity 표시만 하고 복구 수단 없음 | 8초 타임아웃 + 재시도 버튼 추가 |
+
+---
+
 ## [2026-04-09 22:00] ⚡ 파라미터 저장 즉시 반영 — 분석 재시작 없이 다음 프레임부터 적용
 
 ### 💬 논의 및 결정 사항
