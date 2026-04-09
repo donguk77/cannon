@@ -1,3 +1,165 @@
+## [2026-04-09 17:00] 📱 모바일 앱 탭 GUI 추가 — APK QR 다운로드 + 서버 제어
+
+### 💬 논의 및 결정 사항
+- **요청**: 빌드마다 바뀌는 EAS 다운로드 링크를 수동으로 복사하기 불편 → GUI 탭에서 QR 코드로 바로 폰에 전달하고 싶다.
+- **결정**: `gui/tab_mobile.py` 신설. EAS GraphQL API로 최신 APK URL을 조회하고 QR 생성.
+
+### 🛠️ 코드 수정 내역
+- **Added**: `gui/tab_mobile.py`
+  - EXPO_TOKEN 입력 → EAS GraphQL API(`api.expo.dev/graphql`) 호출 → 최신 FINISHED 빌드 URL 조회
+  - `qrcode` 라이브러리로 QR 이미지 생성 → PyQt5 `QPixmap`으로 표시
+  - PC 로컬 IP / 포트 표시
+  - `uvicorn` 폰 서버 시작/중지 버튼 + 실시간 로그
+  - 앱 설치·사용 설명서 (HTML 리치텍스트)
+- **Changed**: `gui/main_window.py` — `📱 모바일 앱` 탭 추가
+
+### 🐛 시행착오
+| 문제 | 원인 | 해결 |
+|------|------|------|
+| "빌드를 찾을 수 없습니다" | REST v2 엔드포인트(`/v2/projects/.../builds`) → 404 반환 | GraphQL API로 교체 (`limit`/`offset` 방식) |
+| QR 코드 표시 안 됨 | `qrcode`가 mode='1' (1-bit) 이미지 생성 → PyQt5 렌더링 실패 | `.convert("RGB")` 후 QPixmap 로드 + `qr_label.clear()` 선행 호출 |
+| `No module named 'qrcode'` | GUI가 `canon_env` 가상환경을 사용하는데 시스템 Python에만 설치됨 | `canon_env\Scripts\pip.exe install "qrcode[pil]"` |
+
+---
+
+## [2026-04-09 16:00] 🤖 GitHub Actions 자동 빌드 설정
+
+### 💬 논의 및 결정 사항
+- **요청**: 매번 터미널에서 `eas build` 명령을 수동으로 실행하기 불편. 코드 push 시 자동으로 APK가 빌드되었으면 함.
+- **결정**: GitHub Actions 워크플로우 추가. `connect_phone/mobile/**` 변경이 `main` 브랜치에 push될 때 자동으로 EAS 빌드 트리거.
+
+### 🛠️ 코드 수정 내역
+- **Added**: `.github/workflows/eas-build.yml`
+  - 트리거: `push` to `main`, path filter `connect_phone/mobile/**`
+  - Steps: checkout → Node.js 18 설치 → EAS CLI 설치 → `npm ci` → `eas build --non-interactive`
+  - `EXPO_TOKEN`은 GitHub Repository Secrets에 저장 (`secrets.EXPO_TOKEN`)
+
+### 📝 설정 방법
+1. GitHub → Settings → Secrets → Actions → `EXPO_TOKEN` 등록
+2. 이후 `git push origin main` 만으로 자동 빌드 시작
+3. 빌드 현황: `github.com/donguk77/cannon/actions`
+
+---
+
+## [2026-04-09 15:00] 📲 WiFi 자동 검색 기능 추가 — URL 입력 불필요
+
+### 💬 논의 및 결정 사항
+- **문제**: APK 설치 후 매번 서버 URL을 수동 입력해야 해서 불편. IP Webcam처럼 자동 연결이 되었으면 함.
+- **결정**: 앱 첫 실행 시 같은 WiFi 서브넷 전체(254개 IP)를 WebSocket으로 동시 탐색 → 첫 응답 서버에 자동 연결.
+
+### 🛠️ 코드 수정 내역
+- **Added**: `connect_phone/mobile/src/utils/discovery.ts`
+  - `expo-network`의 `getIpAddressAsync()`로 폰 IP 취득
+  - 서브넷 254개 IP에 `ws://ip:8765/ws` 동시 연결 시도 (타임아웃 800ms)
+  - 첫 성공 응답 즉시 반환 (Promise race 패턴)
+- **Changed**: `connect_phone/mobile/App.tsx`
+  - AsyncStorage에 저장된 URL 없을 시 → 자동 탐색 → 스피너 표시
+  - 발견 시 URL 저장 후 자동 연결, 실패 시 설정 화면
+- **Changed**: `connect_phone/mobile/src/screens/SettingsScreen.tsx`
+  - "자동 검색" 버튼 추가 (언제든 재탐색 가능)
+- **Added**: `expo-network ~8.0.8` 의존성
+
+### 📝 동작 흐름
+```
+앱 실행 → AsyncStorage 확인
+  ├─ URL 있음 → 바로 연결
+  └─ URL 없음 → "서버 자동 검색 중..." 화면
+                → 서브넷 254개 동시 탐색
+                → 서버 발견 → URL 저장 → 연결
+                → 발견 못함 → 설정 화면 (수동 입력)
+```
+
+---
+
+## [2026-04-09 13:00] ✅ EAS APK 빌드 최종 성공 — VisionCamera 4.7.3 + Gradle 8.13
+
+### 💬 논의 및 결정 사항
+- 빌드 실패 5회 반복 끝에 성공. 각 실패 원인과 해결책은 아래 시행착오 표 참조.
+- 최종 성공 빌드: `https://expo.dev/artifacts/eas/gHQygXzfwezzgUXbTDa8AR.apk`
+
+### 🐛 시행착오 (총 6회 빌드 시도)
+
+#### 빌드 1 — VisionCamera 빌드 의존성 누락
+- **에러**: React Native Gradle Plugin이 VisionCamera NDK 설정을 찾지 못함
+- **원인**: `expo-build-properties` 미설치
+- **해결**: `app.json`에 `expo-build-properties` 플러그인 추가, `minSdkVersion: 26` 설정
+
+#### 빌드 2~3 — expo-modules-core Kotlin 컴파일 실패
+- **에러**: `Unresolved reference 'extensions'` (ExpoModulesGradlePlugin.kt, ProjectConfiguration.kt, ExpoModuleExtension.kt)
+- **원인**: `org.gradle.internal.extensions.core.extra`는 Gradle 내부 API → Gradle 8.8에서 접근 불가
+- **해결**: `patch-package`로 3개 파일의 import를 `org.gradle.kotlin.dsl.extra`로 교체, `build.gradle.kts`에 `gradleKotlinDsl()` 의존성 추가
+  ```
+  patches/expo-modules-core+3.0.29.patch
+  ```
+
+#### 빌드 4~5 — Gradle 버전 불일치
+- **에러**: `Minimum supported Gradle version is 8.13. Current version is 8.8`
+- **원인**: `package.json`의 `"^4.6.4"`가 npm에 의해 최신인 `4.7.3`으로 resolve됨. VisionCamera 4.7.3 → AGP 8.10 → Gradle 8.13 필요
+- **해결 시도 1**: `package.json`을 `"4.6.4"` (정확 버전 고정)
+  - 실패: `package-lock.json`이 여전히 4.7.3 → `npm install`로 lock 파일 재생성 필요
+- **해결 시도 2**: `plugins/withGradleWrapper.js` 추가 (Expo config plugin으로 prebuild 후 Gradle 8.13으로 교체)
+  - 부분 성공: Gradle 8.13 적용됨, 그러나 새 에러 발생
+
+#### 빌드 6 — packageName 못 찾음
+- **에러**: `RNGP - Autolinking: Could not find project.android.packageName`
+- **원인**: EAS가 로컬 `android/` 폴더를 업로드 → prebuild가 "reusing /android"로 불완전한 폴더 재사용. `AndroidManifest.xml`에 `package` 속성 없음 (현대 RN은 `build.gradle`의 `namespace`로 대체됨)
+- **해결**: `react-native.config.js` 추가로 packageName 명시, 로컬 `android/` 폴더 삭제
+
+#### 빌드 7 — VisionCamera 4.6.4 + RN 0.81.5 API 비호환
+- **에러**: 
+  - `CameraViewManager.kt:31 Return type mismatch: Map vs MutableMap`
+  - `CameraViewModule.kt:192 Unresolved reference 'currentActivity'`
+- **원인**: VisionCamera 4.6.4는 RN 0.78 이전 API 사용. `currentActivity`는 RN 0.78+에서 `reactApplicationContext.currentActivity`로 변경됨
+- **해결**: VisionCamera를 `4.7.3`으로 업그레이드 (Gradle 8.13이 이미 해결됐으므로 가능)
+
+### 🛠️ 최종 구성
+| 항목 | 값 |
+|------|-----|
+| react-native-vision-camera | 4.7.3 (exact pin, no ^) |
+| Gradle | 8.13 (withGradleWrapper.js로 강제) |
+| AGP | ~8.7 (RN 0.81.5 기본) |
+| EAS 빌드 이미지 | ubuntu-24.04-jdk-17-ndk-r27b |
+| expo-modules-core 패치 | patches/expo-modules-core+3.0.29.patch |
+
+---
+
+## [2026-04-09 10:00] 📱 모바일 실시간 스트리밍 앱 개발 — react-native-vision-camera 전환
+
+### 💬 논의 및 결정 사항
+- **문제**: 기존 Expo Camera의 `takePictureAsync()`는 셔터 오버헤드 100~500ms → 실시간 전송 불가.
+- **비교 기준**: IP Webcam 앱(MJPEG 네이티브, ~15ms)과 유사한 실시간성 목표.
+- **결정**: `react-native-vision-camera`의 `takeSnapshot()`으로 교체. 셔터 없이 현재 프레임 버퍼에서 즉시 캡처.
+
+### 🛠️ 코드 수정 내역
+- **Added**: `connect_phone/mobile/` 디렉토리 전체 (EAS 빌드 대상)
+  - `src/screens/CameraScreen.tsx`: VisionCamera 기반 카메라 + WebSocket 실시간 전송
+    - `takeSnapshot({ quality: 50, skipMetadata: true })` — 150ms 간격 (~6fps)
+    - 카메라는 화면에 보이지 않음(opacity:0), 서버 분석 결과 프레임을 메인 디스플레이로 사용
+    - 상단 상태바: 연결 상태 dot + latency + PASS/FAIL 뱃지
+  - `src/hooks/useWebSocket.ts`: WebSocket 연결 관리 + 자동 재연결(3초)
+  - `src/screens/SettingsScreen.tsx`: 서버 URL 입력 + AsyncStorage 저장
+  - `App.tsx`: URL 저장 유무에 따라 카메라/설정 화면 분기
+- **Added**: `connect_phone/server/app.py` — FastAPI WebSocket 서버
+  - 폰에서 JPEG bytes 수신 → YOLO + ORB 처리 → base64 인코딩 결과 프레임 반환
+  - `DISPLAY_MAX=640` 비율 보존 리사이즈 (기존 왜곡 수정)
+  - `import base64` 누락 수정
+- **Added**: EAS 빌드 설정
+  - `eas.json`: preview 프로파일, `ubuntu-24.04-jdk-17-ndk-r27b` 이미지
+  - `app.json`: VisionCamera 플러그인, `minSdkVersion: 26`
+  - `.gitignore`: `android/`, `node_modules/` 제외
+  - `patches/`, `plugins/` 디렉토리
+
+### 📝 아키텍처
+```
+[폰 카메라] --takeSnapshot()--> [JPEG bytes]
+    → WebSocket ws://PC:8765/ws
+    → FastAPI 서버 → YOLO + ORB 분석
+    → base64 JPEG 응답
+    → 폰 화면에 분석 결과 표시
+```
+
+---
+
 ## [2026-04-07 18:30] 🔧 ORB 전처리 파이프라인 확장 — Blur·Gamma·Sharpening 파라미터화
 
 ### 💬 논의 및 결정 사항 (Discussion)
@@ -1926,3 +2088,64 @@ py -3.11    → Python 3.11.9  (PyTorch/YOLO/Ultralytics 학습용)
 - **Added**: 문서의 계획에 따라 빈 디렉터리 및 placeholder 파일들을 일괄 생성함.
   - 디렉터리: `models/siamese_anchor`, `engine`, `offline`, `data/targets`, `data/pending`, `data/labeled`, `data/rejected`, `data/logs`, `gui/assets`, `db`, `scripts`
   - 파일: `models/config.json`, `engine/detector.py`, `engine/matcher.py`, `engine/ocr_fallback.py`, `engine/preprocessor.py`, `engine/frame_skipper.py`, `offline/siamese_classifier.py`, `offline/llm_judge.py`, `offline/auto_tuner.py`, `gui/main_window.py`, `gui/tab_monitor.py`, `gui/tab_training.py`, `gui/tab_history.py`, `db/canon.db`, `scripts/fps_benchmark.py`, `scripts/video_to_frames.py`, `scripts/train_yolo.py`
+
+## [2026-04-08] 📱 핸드폰 연결 앱 — WebSocket 서버 연동 및 실시간 분석 영상 전송 구현
+### 💬 논의 및 결정 사항 (Discussion)
+- 핸드폰 카메라를 통해 PC의 YOLO+ORB 파이프라인에 실시간 영상을 보내고, 분석 결과를 영상에 직접 그려서 폰 화면에 돌려주는 구조를 완성함.
+- FastAPI WebSocket 서버(`connect_phone/server/app.py`)에 `uvicorn[standard]`, `websockets` 패키지가 누락되어 WebSocket 연결이 404로 떨어지는 문제를 수정함.
+- 서버가 고정 640×360으로 리사이즈하면 세로(portrait) 영상이 왜곡되는 문제를 발견하여, 종횡비를 유지하는 `DISPLAY_MAX=640` 방식으로 수정함.
+- 폰 화면에서 카메라 라이브 뷰 위에 오버레이를 그리는 방식 대신, 서버가 어노테이션(YOLO 폴리곤, PASS/FAIL 텍스트)을 직접 그린 프레임을 폰 메인 화면에 표시하는 방식으로 전환함.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Fixed** `connect_phone/server/app.py`:
+  - `base64` import 추가
+  - 디스플레이용 종횡비 유지 리사이즈 로직 추가 (`scale_d = DISPLAY_MAX / max(fw, fh)`)
+  - ORB 처리는 기존 640×360 고정 크기 유지, 디스플레이용은 별도 `display_frame` 생성
+  - `process()` 결과에 어노테이션 프레임 추가: YOLO 폴리곤, PASS/FAIL 텍스트를 `display_frame`에 그린 뒤 JPEG base64로 인코딩하여 `"frame"` 필드로 반환
+  - `uvicorn[standard]`, `websockets`, `fastapi`, `httptools` 패키지 설치 (WebSocket 지원)
+- **Updated** `connect_phone/mobile/src/hooks/useWebSocket.ts`:
+  - `MatchResult` 타입에 `frame: string | null` 필드 추가
+- **Refactored** `connect_phone/mobile/src/screens/CameraScreen.tsx`:
+  - CameraView를 `opacity: 0`으로 백그라운드 캡처 전용으로 전환 (화면에 직접 표시 안 함)
+  - 서버로부터 받은 어노테이션 프레임(`result.frame`)을 메인 화면에 `Image` 컴포넌트로 표시
+  - 연결 미완료 시 "연결 중..." 대기 화면 표시
+  - `takePictureAsync` 방식을 `base64: true`로 변경하여 파일 I/O 없이 직접 전송
+  - 전송 간격 300ms → 250ms (~4fps), JPEG quality 0.35 → 0.4 조정
+  - `OverlayView` 의존성 제거, 상단 상태 바(연결 상태 + PASS/FAIL 배지) 직접 구현
+
+### 🔧 트러블슈팅 (Troubleshooting)
+- **WebSocket 404**: uvicorn 기본 설치에 WebSocket 라이브러리 미포함 → `pip install "uvicorn[standard]" websockets` 로 해결
+- **방화벽 차단**: 포트 8765 인바운드 규칙 없어서 폰에서 접속 불가 → 관리자 CMD에서 `netsh advfirewall firewall add rule` 으로 해결
+- **서버 IP 혼동**: `ipconfig`에서 172.17.x.x가 WSL/Docker IP가 아닌 실제 WiFi IP임을 확인 (학교/사무실 네트워크)
+- **portrait 왜곡**: 폰 세로 영상을 서버에서 640×360(가로)으로 강제 리사이즈 → 종횡비 유지 리사이즈로 수정
+
+## [2026-04-08] 📋 핸드폰 앱 실시간성 개선 — 다음 세션 진행 예정
+### 💬 논의 및 결정 사항 (Discussion)
+- 현재 Expo Camera의 `takePictureAsync` 방식은 매 프레임마다 하드웨어 셔터 → 파일 → 인코딩 과정을 거쳐 100~500ms 오버헤드가 발생함.
+- 사용자가 이전에 IP Webcam 앱 + 브라우저 연결 방식으로 YOLO bbox 포함 약 0.15초 딜레이를 경험한 바 있음.
+- IP Webcam은 네이티브 카메라 버퍼에 직접 접근해 MJPEG을 스트리밍하기 때문에 빠르나, 매번 URL 수동 입력이 필요하고 같은 WiFi 환경을 전제로 함.
+- 목표: IP Webcam 없이 자체 앱으로 앱 실행 시 자동 연결 + IP Webcam 수준의 실시간성 달성.
+
+### 🎯 다음 세션 작업 계획 (Next Steps)
+- **`expo-camera` → `react-native-vision-camera` v4 마이그레이션**
+  - VisionCamera의 프레임 프로세서(Frame Processor)는 카메라 스레드에서 직접 실행 (~30fps 접근 가능)
+  - `takeSnapshot()` API 사용: `takePictureAsync`보다 훨씬 빠름
+  - IP Webcam 수준의 실시간성(~0.15s 딜레이) 달성 목표
+- **EAS 클라우드 빌드로 APK 제작**
+  - 이전 로컬 빌드 실패 원인: 한글 경로 문제 + AGP 8.8 호환성 문제
+  - EAS 클라우드 빌드는 Expo 서버에서 빌드하므로 로컬 환경 문제 없음
+  - `eas build --platform android --profile preview` 로 APK 생성
+  - 빌드 시간 약 10분, 다운로드 링크로 APK 직접 설치
+- **서버 측 기존 기능 연동 확인**
+  - 프레임 스킵 + 좀비 스태빌라이저(유령 메모리) 기능이 phone 서버에도 반영되도록 확인
+  - `engine/frame_skipper.py` 로직을 `connect_phone/server/app.py`에 통합
+- **자동 연결 유지**
+  - 앱 첫 실행 시 URL 1회 입력 후 AsyncStorage에 저장
+  - 이후 앱 실행 시 자동 연결 (현재 구현 그대로 유지)
+
+### 🔧 현재 상태 (Current State)
+- `connect_phone/server/app.py`: FastAPI WebSocket 서버 정상 작동, 어노테이션 프레임 반환 구현 완료
+- `connect_phone/mobile/`: Expo SDK 54, `expo-camera` v17 사용 중 (`takePictureAsync` 방식 — 성능 한계)
+- 서버 실행 명령: `cd "머신러닝 캐논 2.1" && source canon_env/Scripts/activate && python -m uvicorn connect_phone.server.app:app --host 0.0.0.0 --port 8765`
+- 폰 IP: 172.17.132.234, PC IP: 172.17.129.63 (같은 WiFi)
+- EAS 계정 보유 여부 미확인 → 다음 세션 시작 시 `eas login` 상태 확인 필요
