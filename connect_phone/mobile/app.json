@@ -21,11 +21,27 @@
     },
     "plugins": [
       [
-        "expo-camera",
+        "react-native-vision-camera",
         {
-          "cameraPermission": "카메라로 모니터 화면을 분석합니다."
+          "cameraPermissionText": "카메라로 모니터 화면을 분석합니다.",
+          "enableFrameProcessors": false
         }
-      ]
-    ]
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 26
+          }
+        }
+      ],
+      "./plugins/withGradleWrapper"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "7874aedd-42a7-4517-8f82-04ea104a0386"
+      }
+    },
+    "owner": "donguknan"
   }
 }

@@ -1,17 +1,21 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import {
   View, TouchableOpacity, Text, StyleSheet,
-  Dimensions, SafeAreaView,
+  Dimensions, SafeAreaView, Image,
 } from 'react-native';
-import { CameraView, useCameraPermissions, CameraType } from 'expo-camera';
+import {
+  Camera,
+  useCameraDevice,
+  useCameraPermission,
+  useCameraFormat,
+} from 'react-native-vision-camera';
 import { useWebSocket } from '../hooks/useWebSocket';
-import OverlayView from '../components/OverlayView';
 
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
 
-// 전송 간격 (ms) — 낮출수록 FPS 높아지지만 서버 부하 증가
-const SEND_INTERVAL_MS = 300;   // ~3fps
-const JPEG_QUALITY     = 0.35;  // 0.0~1.0 (낮을수록 작은 파일)
+// 전송 간격 (ms) — takeSnapshot은 takePictureAsync보다 훨씬 빠름
+const SEND_INTERVAL_MS = 150;   // ~6fps
+const JPEG_QUALITY     = 50;    // 0~100
 
 type Props = {
   serverUrl: string;
@@ -19,15 +23,21 @@ type Props = {
 };
 
 export default function CameraScreen({ serverUrl, onOpenSettings }: Props) {
-  const [permission, requestPermission] = useCameraPermissions();
-  const [facing, setFacing]   = useState<CameraType>('back');
-  const cameraRef             = useRef<CameraView>(null);
-  const isSendingRef          = useRef(false);
-  const intervalRef           = useRef<ReturnType<typeof setInterval> | null>(null);
+  const { hasPermission, requestPermission } = useCameraPermission();
+  const [facing, setFacing]  = useState<'back' | 'front'>('back');
+  const device               = useCameraDevice(facing);
+  const cameraRef            = useRef<Camera>(null);
+  const isSendingRef         = useRef(false);
+  const intervalRef          = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // 캡처 해상도 낮춰서 속도 향상
+  const format = useCameraFormat(device, [
+    { videoResolution: { width: 1280, height: 720 } },
+  ]);
 
   const { wsState, result, latencyMs, sendFrame } = useWebSocket(serverUrl);
 
-  // 주기적으로 프레임 캡처 → 전송
+  // 주기적으로 스냅샷 캡처 → 전송
   const startCapture = useCallback(() => {
     if (intervalRef.current) clearInterval(intervalRef.current);
     intervalRef.current = setInterval(async () => {
@@ -36,17 +46,16 @@ export default function CameraScreen({ serverUrl, onOpenSettings }: Props) {
 
       isSendingRef.current = true;
       try {
-        const photo = await cameraRef.current.takePictureAsync({
-          base64: false,
+        // takeSnapshot: 셔터 없이 현재 프레임 버퍼에서 즉시 캡처 (takePictureAsync보다 훨씬 빠름)
+        const snapshot = await cameraRef.current.takeSnapshot({
           quality: JPEG_QUALITY,
-          skipProcessing: true,
-          exif: false,
+          skipMetadata: true,
         });
-        if (!photo?.uri) return;
 
-        // uri → fetch → ArrayBuffer → Uint8Array
-        const resp  = await fetch(photo.uri);
-        const buf   = await resp.arrayBuffer();
+        // 파일 경로 → ArrayBuffer → Uint8Array
+        const uri  = snapshot.path.startsWith('file://') ? snapshot.path : `file://${snapshot.path}`;
+        const resp = await fetch(uri);
+        const buf  = await resp.arrayBuffer();
         sendFrame(new Uint8Array(buf));
       } catch (_) {
       } finally {
@@ -63,8 +72,7 @@ export default function CameraScreen({ serverUrl, onOpenSettings }: Props) {
   }, [startCapture]);
 
   // 권한 미허가
-  if (!permission) return <View style={styles.container} />;
-  if (!permission.granted) {
+  if (!hasPermission) {
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.permBox}>
@@ -77,35 +85,81 @@ export default function CameraScreen({ serverUrl, onOpenSettings }: Props) {
     );
   }
 
+  if (!device) {
+    return (
+      <View style={styles.container}>
+        <Text style={{ color: '#fff', textAlign: 'center', marginTop: 100 }}>
+          카메라를 찾을 수 없습니다
+        </Text>
+      </View>
+    );
+  }
+
+  const isConnected = wsState === 'connected';
+  const isPass      = result?.status === 'pass';
+  const dotColor    = wsState === 'connected'  ? '#00E676'
+                    : wsState === 'connecting' ? '#FFAB00' : '#FF1744';
+  const connLabel   = wsState === 'connected'  ? '연결됨'
+                    : wsState === 'connecting' ? '연결 중...' : '연결 끊김';
+
   return (
     <View style={styles.container}>
-      <CameraView
+
+      {/* ── 캡처 전용 카메라 (화면에 보이지 않음) ── */}
+      <Camera
         ref={cameraRef}
-        style={StyleSheet.absoluteFill}
-        facing={facing}
+        style={styles.hiddenCamera}
+        device={device}
+        format={format}
+        isActive={true}
+        photo={true}
       />
 
-      {/* 결과 오버레이 */}
-      <OverlayView
-        result={result}
-        wsState={wsState}
-        latencyMs={latencyMs}
-        cameraWidth={SCREEN_W}
-        cameraHeight={SCREEN_H}
-      />
+      {/* ── 메인 디스플레이: 서버 분석 결과 프레임 ── */}
+      {result?.frame && isConnected ? (
+        <Image
+          source={{ uri: `data:image/jpeg;base64,${result.frame}` }}
+          style={styles.serverFrame}
+          resizeMode="contain"
+          fadeDuration={0}
+        />
+      ) : (
+        <View style={styles.waitScreen}>
+          <View style={[styles.dot, { backgroundColor: dotColor }]} />
+          <Text style={styles.waitText}>{connLabel}</Text>
+          {wsState === 'connected' && (
+            <Text style={styles.waitSub}>서버 분석 대기 중...</Text>
+          )}
+        </View>
+      )}
 
-      {/* 하단 컨트롤 바 */}
+      {/* ── 상단 상태 바 ── */}
+      <SafeAreaView style={styles.topBar} pointerEvents="none">
+        <View style={styles.statusRow}>
+          <View style={[styles.dot, { backgroundColor: dotColor }]} />
+          <Text style={styles.statusText}>{connLabel}</Text>
+          {isConnected && latencyMs > 0 && (
+            <Text style={styles.latency}>{latencyMs.toFixed(0)}ms</Text>
+          )}
+          {result && isConnected && (
+            <View style={[styles.badge, { backgroundColor: isPass ? '#00C853' : '#D50000' }]}>
+              <Text style={styles.badgeText}>
+                {isPass ? `✓ PASS  Target ${result.target_id}` : '✗ FAIL'}
+              </Text>
+            </View>
+          )}
+        </View>
+      </SafeAreaView>
+
+      {/* ── 하단 컨트롤 바 ── */}
       <SafeAreaView style={styles.controlBar} pointerEvents="box-none">
         <View style={styles.controls}>
-          {/* 전후면 전환 */}
           <TouchableOpacity
             style={styles.ctrlBtn}
             onPress={() => setFacing(f => f === 'back' ? 'front' : 'back')}
           >
             <Text style={styles.ctrlIcon}>🔄</Text>
           </TouchableOpacity>
-
-          {/* 설정 */}
           <TouchableOpacity style={styles.ctrlBtn} onPress={onOpenSettings}>
             <Text style={styles.ctrlIcon}>⚙️</Text>
           </TouchableOpacity>
@@ -120,6 +174,71 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#000',
   },
+  hiddenCamera: {
+    position: 'absolute',
+    width: SCREEN_W,
+    height: SCREEN_H,
+    opacity: 0,
+  },
+  serverFrame: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#000',
+  },
+  waitScreen: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 12,
+    backgroundColor: '#0d0d1a',
+  },
+  waitText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '600',
+  },
+  waitSub: {
+    color: '#888',
+    fontSize: 13,
+  },
+  topBar: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+  },
+  dot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
+  statusText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  latency: {
+    color: '#aaa',
+    fontSize: 11,
+  },
+  badge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  badgeText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: 'bold',
+  },
   controlBar: {
     position: 'absolute',
     bottom: 0,
@@ -132,7 +251,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingVertical: 16,
     paddingHorizontal: 40,
-    backgroundColor: 'rgba(0,0,0,0.45)',
+    backgroundColor: 'rgba(0,0,0,0.55)',
   },
   ctrlBtn: {
     width: 52,
