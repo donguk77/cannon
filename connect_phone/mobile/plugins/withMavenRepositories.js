@@ -1,9 +1,10 @@
 /**
- * EAS 빌드 서버에서 Maven Central 429 (Too Many Requests) 에러가 발생할 때를 대비해
- * settings.gradle의 pluginManagement.repositories 블록에 JetBrains 미러를 추가한다.
+ * 메인 android/settings.gradle의 pluginManagement.repositories에
+ * repo1.maven.org 미러를 추가한다.
  *
- * 원인: Gradle이 settings 평가 중 expo-autolinking-plugin-shared의 Kotlin 아티팩트
- * (kotlin-util-klib 등)를 Maven Central에서 다운로드할 때 rate limit에 걸리는 현상.
+ * 참고: 이 플러그인은 메인 settings.gradle만 수정한다.
+ * includeBuild(expo-gradle-plugin)의 settings는 patch-package(patches/ 디렉토리)로,
+ * 모든 빌드 전반에는 withGradleInit.js(init script)로 처리한다.
  */
 const { withDangerousMod } = require('@expo/config-plugins');
 const fs = require('fs');
@@ -23,15 +24,14 @@ module.exports = function withMavenRepositories(config) {
       let content = fs.readFileSync(settingsPath, 'utf8');
 
       // 이미 패치됐으면 스킵
-      if (content.includes('cache-redirector.jetbrains.com')) return config;
+      if (content.includes('repo1.maven.org')) return config;
 
       // pluginManagement.repositories 안의 gradlePluginPortal() 뒤에 미러 삽입
-      // → Maven Central 429 시 JetBrains 캐시로 폴백
       if (content.includes('gradlePluginPortal()')) {
         content = content.replace(
           'gradlePluginPortal()',
           `gradlePluginPortal()
-        maven { url "https://cache-redirector.jetbrains.com/maven-central" }`
+        maven { url "https://repo1.maven.org/maven2/" }`
         );
         fs.writeFileSync(settingsPath, content);
       }

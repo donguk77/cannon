@@ -37,7 +37,8 @@
         }
       ],
       "./plugins/withGradleWrapper",
-      "./plugins/withMavenRepositories"
+      "./plugins/withMavenRepositories",
+      "./plugins/withGradleInit"
     ],
     "extra": {
       "eas": {
