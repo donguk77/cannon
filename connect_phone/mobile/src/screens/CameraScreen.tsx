@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import {
   View, TouchableOpacity, Text, StyleSheet,
-  Dimensions, SafeAreaView,
+  Dimensions, SafeAreaView, ActivityIndicator,
 } from 'react-native';
 import {
   Camera,
@@ -29,6 +29,11 @@ export default function CameraScreen({ serverUrl, onOpenSettings }: Props) {
   const [facing,   setFacing]  = useState<'back' | 'front'>('back');
   const [zoom,     setZoom]    = useState(1);
   const [torch,    setTorch]   = useState<'off' | 'on'>('off');
+
+  // 앱 실행 시 권한 자동 요청
+  useEffect(() => {
+    if (!hasPermission) requestPermission();
+  }, [hasPermission, requestPermission]);
 
   const device      = useCameraDevice(facing);
   const cameraRef   = useRef<Camera>(null);
@@ -88,11 +93,13 @@ export default function CameraScreen({ serverUrl, onOpenSettings }: Props) {
     );
   }
 
+  // device가 아직 로딩 중이거나 권한 승인 직후 초기화 중인 경우 — 잠시 대기
   if (!device) {
     return (
       <View style={styles.container}>
         <View style={styles.centerBox}>
-          <Text style={styles.msgText}>카메라를 찾을 수 없습니다</Text>
+          <ActivityIndicator size="large" color="#3498DB" />
+          <Text style={styles.msgText}>카메라 초기화 중...</Text>
         </View>
       </View>
     );
