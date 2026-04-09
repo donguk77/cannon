@@ -239,6 +239,10 @@ class AppStudioMainWindow(QMainWindow):
         self.tabs.addTab(self.mobile_tab,    "  📱  모바일 앱  ")
         root_layout.addWidget(self.tabs, stretch=1)
 
+        # 파라미터 저장 시 실시간 관제 스레드에 즉시 반영
+        if hasattr(self.guide_tab, 'params_saved') and hasattr(self.monitor_tab, 'on_params_reloaded'):
+            self.guide_tab.params_saved.connect(self.monitor_tab.on_params_reloaded)
+
         # 3. 하단 E-STOP
         root_layout.addWidget(EStopBar())
 

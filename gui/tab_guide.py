@@ -1176,6 +1176,8 @@ class CategoryHeader(QWidget):
 # ─── 메인 탭 ────────────────────────────────────────────────────────────────
 class GuideTab(QWidget):
     """탭 4: 파라미터 가이드 (설정 패널 + 가이드북 분리)"""
+    params_saved = pyqtSignal()   # 저장 완료 시 외부(MonitorTab)에 즉시 반영 요청
+
     def __init__(self):
         super().__init__()
         self.setStyleSheet(f"background:{C_BG};")
@@ -1500,10 +1502,11 @@ class GuideTab(QWidget):
             cfg[key] = sb.value()
         try:
             save_params_config(cfg)
+            self.params_saved.emit()
             QMessageBox.information(
                 self, "저장 완료",
                 "파라미터 설정이 저장되었습니다.\n\n"
-                "변경 사항은 영상 분석을 다시 시작할 때 적용됩니다."
+                "분석 중이면 다음 프레임부터 즉시 반영됩니다."
             )
         except Exception as e:
             QMessageBox.critical(self, "저장 실패", f"설정 파일 저장 중 오류가 발생했습니다.\n{e}")

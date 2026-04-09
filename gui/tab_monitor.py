@@ -949,6 +949,9 @@ class VideoThread(QThread):
         self._last_best_target_id = ''    # 최근 매칭된 타겟 ID (스킵 프레임에서도 유지)
         self._last_display_frame  = None  # ROI 오버레이가 그려진 최근 분석 프레임
         self.show_crop            = False # True: YOLO 크롭 뷰, False: 풀프레임 뷰
+        self._reload_requested    = False # 파라미터 즉시 재적용 플래그
+        self._match_threshold     = MATCH_THRESHOLD
+        self._roi_match_threshold = 7
 
     def pause_resume(self):
         self._paused = not self._paused
@@ -1022,7 +1025,8 @@ class VideoThread(QThread):
                 print(f"[VideoThread] 타겟 로드 실패: {e}")
 
         from engine.matcher import RESIZE_W, RESIZE_H
-        ROI_MATCH_THRESHOLD = int(_cfg["roi_match_threshold"])
+        self._roi_match_threshold = int(_cfg["roi_match_threshold"])
+        self._match_threshold     = int(_cfg.get("MATCH_THRESHOLD", MATCH_THRESHOLD))
 
         cap = cv2.VideoCapture(self.source)
         if not cap.isOpened(): return
@@ -1039,6 +1043,10 @@ class VideoThread(QThread):
             if self._paused:
                 self.msleep(50)
                 continue
+
+            if self._reload_requested:
+                self._apply_reload_params()
+                self._reload_requested = False
 
             ret, frame = cap.read()
             if not ret:
@@ -1128,7 +1136,7 @@ class VideoThread(QThread):
                         for roi_idx, (t_des, rx1, ry1, rx2, ry2) in enumerate(rois):
                             q_des = live_roi_features.get((rx1, ry1, rx2, ry2))
                             s, p = self.matcher.compare_descriptors(
-                                q_des, t_des, threshold=ROI_MATCH_THRESHOLD)
+                                q_des, t_des, threshold=self._roi_match_threshold)
                             if s > max_s: max_s = s
                             if p: l_passed += 1
                             l_detail.append((tid, roi_idx, rx1, ry1, rx2, ry2, s, p))
@@ -1205,7 +1213,7 @@ class VideoThread(QThread):
                     # ⑤ 애매한 점수대(Hard Mining) → pending 캡처
                     # 의미 없는(너무 낮은) 점수는 버리고, 커트라인 근접 데이터만 수집
                     margin = 2 if roi_total > 0 else 3
-                    target_thr = ROI_MATCH_THRESHOLD if roi_total > 0 else MATCH_THRESHOLD
+                    target_thr = self._roi_match_threshold if roi_total > 0 else self._match_threshold
 
                     if abs(score - target_thr) <= margin:
                         from datetime import datetime as _dt
@@ -1300,6 +1308,39 @@ class VideoThread(QThread):
         """CLAHE 전처리 ON/OFF — 런닝 중 즉시 적용"""
         self.use_clahe = enabled
         print(f"[VideoThread] CLAHE {'ON' if enabled else 'OFF'}")
+
+    def reload_params(self):
+        """파라미터 가이드에서 저장 시 호출 — 다음 프레임에서 즉시 재초기화"""
+        self._reload_requested = True
+
+    def _apply_reload_params(self):
+        """params_config.json을 다시 읽어 preprocessor/matcher/thresholds 재초기화"""
+        try:
+            from engine.preprocessor import ImagePreprocessor
+            from engine.matcher      import ScreenMatcher
+            _cfg = _load_params_config()
+            tile = int(_cfg["clahe_tile_grid"])
+            self.preprocessor = ImagePreprocessor(
+                clahe_clip_limit=float(_cfg["clahe_clip_limit"]),
+                clahe_tile_grid=(tile, tile),
+                blur_ksize=int(_cfg.get("blur_ksize", 0)),
+                gamma=float(_cfg.get("gamma", 1.0)),
+                sharpen_amount=float(_cfg.get("sharpen_amount", 1.0)),
+            )
+            self.matcher = ScreenMatcher(
+                orb_nfeatures=int(_cfg["nfeatures"]),
+                lowe_ratio=float(_cfg["lowe_ratio"]),
+                match_threshold=int(_cfg["match_threshold"]),
+            )
+            self._roi_match_threshold = int(_cfg["roi_match_threshold"])
+            self._match_threshold     = int(_cfg.get("MATCH_THRESHOLD", MATCH_THRESHOLD))
+            # 타겟 특징점도 새 matcher로 재로드
+            td = os.path.join(_ROOT, "data", "targets")
+            self.targets = self.matcher.load_targets_from_dir(
+                td, ROI_SAVE_FILE, detector=self.detector)
+            print(f"[VideoThread] 파라미터 즉시 재적용 완료")
+        except Exception as ex:
+            print(f"[VideoThread] 파라미터 재적용 실패: {ex}")
 
     def set_show_crop(self, enabled: bool):
         """뷰 모드 전환 — True: YOLO 크롭 뷰, False: 풀프레임 뷰 (런닝 중 즉시 적용)"""
@@ -1751,6 +1792,11 @@ class LiveMonitorSubTab(QWidget):
         self.slider.setValue(0)
         self.lbl_st.setText("● 정지")
         self.lbl_st.setStyleSheet(f"font-size:12px; font-weight:bold; color:{C_SUB}; padding-left:6px;")
+
+    def on_params_reloaded(self):
+        """파라미터 가이드에서 저장 시 호출 — 분석 중이면 다음 프레임에 즉시 반영"""
+        if self._thread and self._thread.isRunning():
+            self._thread.reload_params()
 
     def _on_progress(self, cur, tot):
         if not self.slider.isSliderDown():
@@ -2445,7 +2491,12 @@ class MonitorTab(QWidget):
                 border:1px solid {C_BORDER};border-bottom:none;border-radius:4px 4px 0 0; margin-right:2px;}}
             QTabBar::tab:selected{{background:{C_WHITE};color:{C_BLUE};border-bottom:2px solid {C_BLUE};}}
         """)
-        sub.addTab(LiveMonitorSubTab(),      "  🎥  실시간 Live 관제  ")
+        self.live_tab = LiveMonitorSubTab()
+        sub.addTab(self.live_tab,            "  🎥  실시간 Live 관제  ")
         sub.addTab(TargetROITab(),           "  🎯  타겟 뷰어 & ROI 설정  ")
         sub.addTab(SiameseMonitorSubTab(),   "  🧬  샴 네트워크 관제  ")
         v.addWidget(sub)
+
+    def on_params_reloaded(self):
+        """파라미터 가이드 저장 시 호출 → 분석 스레드에 즉시 반영"""
+        self.live_tab.on_params_reloaded()
