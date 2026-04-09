@@ -7,9 +7,10 @@ import {
 type Props = {
   currentUrl: string;
   onSave: (url: string) => void;
+  onScan: () => void;
 };
 
-export default function SettingsScreen({ currentUrl, onSave }: Props) {
+export default function SettingsScreen({ currentUrl, onSave, onScan }: Props) {
   const [url, setUrl] = useState(currentUrl);
 
   const handleSave = () => {
@@ -26,15 +27,20 @@ export default function SettingsScreen({ currentUrl, onSave }: Props) {
       >
         <Text style={styles.title}>서버 연결 설정</Text>
         <Text style={styles.subtitle}>
-          PC에서 start.bat 실행 후{'\n'}
-          터미널에 출력된 URL을 입력하세요.
+          PC에서 서버를 실행한 후 자동 검색을 누르세요.{'\n'}
+          같은 WiFi에 연결되어 있어야 합니다.
         </Text>
 
-        {/* URL 예시 안내 */}
-        <View style={styles.exampleBox}>
-          <Text style={styles.exampleLabel}>URL 예시</Text>
-          <Text style={styles.exampleText}>https://xxxx.trycloudflare.com</Text>
-          <Text style={styles.exampleText}>http://192.168.0.10:8765  (같은 WiFi)</Text>
+        {/* 자동 검색 버튼 */}
+        <TouchableOpacity style={styles.scanBtn} onPress={onScan}>
+          <Text style={styles.scanIcon}>🔍</Text>
+          <Text style={styles.scanBtnText}>자동 검색</Text>
+        </TouchableOpacity>
+
+        <View style={styles.divider}>
+          <View style={styles.dividerLine} />
+          <Text style={styles.dividerText}>또는 직접 입력</Text>
+          <View style={styles.dividerLine} />
         </View>
 
         <Text style={styles.label}>서버 URL</Text>
@@ -42,7 +48,7 @@ export default function SettingsScreen({ currentUrl, onSave }: Props) {
           style={styles.input}
           value={url}
           onChangeText={setUrl}
-          placeholder="https://xxxx.trycloudflare.com"
+          placeholder="http://192.168.1.50:8765"
           placeholderTextColor="#555"
           autoCapitalize="none"
           autoCorrect={false}
@@ -87,25 +93,40 @@ const styles = StyleSheet.create({
     lineHeight: 22,
     marginBottom: 24,
   },
-  exampleBox: {
-    backgroundColor: '#1a1a2e',
-    borderRadius: 8,
-    padding: 14,
+  scanBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#1e3a5f',
+    borderWidth: 1,
+    borderColor: '#3498DB',
+    borderRadius: 12,
+    paddingVertical: 16,
+    gap: 10,
     marginBottom: 24,
-    gap: 4,
   },
-  exampleLabel: {
+  scanIcon: {
+    fontSize: 20,
+  },
+  scanBtnText: {
     color: '#3498DB',
-    fontSize: 11,
-    fontWeight: '700',
-    marginBottom: 4,
-    textTransform: 'uppercase',
-    letterSpacing: 0.8,
+    fontSize: 17,
+    fontWeight: 'bold',
   },
-  exampleText: {
-    color: '#aaa',
-    fontSize: 13,
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  divider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 20,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: '#333',
+  },
+  dividerText: {
+    color: '#555',
+    fontSize: 12,
   },
   label: {
     color: '#ccc',
