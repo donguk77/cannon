@@ -33,23 +33,63 @@ const MODE_META: Record<Mode, { label: string; icon: string }> = {
   live:  { label: '실시간', icon: '🎥' },
 };
 
+// ── 권한 가드 — 권한 확인 후에만 CameraContent를 마운트 ───────────────────
+// useCameraDevice 훅은 마운트 시점에 Camera.getAvailableCameraDevices()를
+// 동기 호출하므로, 권한이 없는 상태에서 마운트되면 빈 배열을 받아 device가
+// undefined로 고정된다. 권한 승인 후 CameraDevicesChanged 이벤트가 일부
+// Android 기기에서 발화되지 않아 스피너가 무한 돌게 되는 문제를 이 분리로 해결.
 export default function CameraScreen({ serverUrl, onOpenSettings }: Props) {
   const { hasPermission, requestPermission } = useCameraPermission();
-  const [facing,    setFacing]    = useState<'back' | 'front'>('back');
-  const [zoom,      setZoom]      = useState(1);
-  const [torch,     setTorch]     = useState<'off' | 'on'>('off');
-  const [mode,      setMode]      = useState<Mode>('live');
-  const [streaming, setStreaming] = useState(false);   // 실시간 모드 시작/정지
-  const [busy,      setBusy]      = useState(false);   // 사진/파일 처리 중
 
   useEffect(() => {
     if (!hasPermission) requestPermission();
   }, [hasPermission, requestPermission]);
 
+  if (!hasPermission) {
+    return (
+      <SafeAreaView style={styles.fullDark}>
+        <View style={styles.centerBox}>
+          <Text style={styles.msgText}>카메라 권한이 필요합니다</Text>
+          <TouchableOpacity style={styles.primaryBtn} onPress={requestPermission}>
+            <Text style={styles.primaryBtnText}>권한 허용</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  // 권한이 확인된 이후에만 마운트 → useCameraDevice가 항상 권한 있는 상태로 초기화
+  return <CameraContent serverUrl={serverUrl} onOpenSettings={onOpenSettings} />;
+}
+
+// ── 실제 카메라 UI — 권한 보장 후 마운트 ──────────────────────────────────
+function CameraContent({ serverUrl, onOpenSettings }: Props) {
+  const [facing,    setFacing]    = useState<'back' | 'front'>('back');
+  const [zoom,      setZoom]      = useState(1);
+  const [torch,     setTorch]     = useState<'off' | 'on'>('off');
+  const [mode,      setMode]      = useState<Mode>('live');
+  const [streaming, setStreaming] = useState(false);
+  const [busy,      setBusy]      = useState(false);
+
+  // device 탐색 실패 시 재시도를 위한 키
+  const [deviceKey, setDeviceKey] = useState(0);
+  // 타임아웃 후 에러 표시용
+  const [deviceTimeout, setDeviceTimeout] = useState(false);
+
   const device      = useCameraDevice(facing);
   const cameraRef   = useRef<Camera>(null);
   const sendingRef  = useRef(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // device가 없을 때 8초 후 에러 상태로 전환
+  useEffect(() => {
+    if (device) {
+      setDeviceTimeout(false);
+      return;
+    }
+    const timer = setTimeout(() => setDeviceTimeout(true), 8000);
+    return () => clearTimeout(timer);
+  }, [device, deviceKey]);
 
   const minZoom = device?.minZoom ?? 1;
   const maxZoom = Math.min(device?.maxZoom ?? 8, 8);
@@ -139,26 +179,28 @@ export default function CameraScreen({ serverUrl, onOpenSettings }: Props) {
     }
   };
 
-  // ── 권한 미허가 ──────────────────────────────────────────────────────────
-  if (!hasPermission) {
-    return (
-      <SafeAreaView style={styles.fullDark}>
-        <View style={styles.centerBox}>
-          <Text style={styles.msgText}>카메라 권한이 필요합니다</Text>
-          <TouchableOpacity style={styles.primaryBtn} onPress={requestPermission}>
-            <Text style={styles.primaryBtnText}>권한 허용</Text>
-          </TouchableOpacity>
-        </View>
-      </SafeAreaView>
-    );
-  }
-
+  // ── device 없음 (초기화 중 또는 탐색 실패) ──────────────────────────────
   if (!device) {
     return (
       <View style={styles.fullDark}>
         <View style={styles.centerBox}>
-          <ActivityIndicator size="large" color="#3498DB" />
-          <Text style={styles.msgText}>카메라 초기화 중...</Text>
+          {deviceTimeout ? (
+            <>
+              <Text style={styles.msgText}>카메라를 찾을 수 없습니다</Text>
+              <Text style={styles.msgSub}>기기가 카메라를 인식하지 못했습니다</Text>
+              <TouchableOpacity
+                style={styles.primaryBtn}
+                onPress={() => { setDeviceTimeout(false); setDeviceKey(k => k + 1); }}
+              >
+                <Text style={styles.primaryBtnText}>다시 시도</Text>
+              </TouchableOpacity>
+            </>
+          ) : (
+            <>
+              <ActivityIndicator size="large" color="#3498DB" />
+              <Text style={styles.msgText}>카메라 초기화 중...</Text>
+            </>
+          )}
         </View>
       </View>
     );
@@ -378,6 +420,11 @@ const styles = StyleSheet.create({
   msgText: {
     color: '#fff',
     fontSize: 16,
+  },
+  msgSub: {
+    color: '#888',
+    fontSize: 13,
+    textAlign: 'center',
   },
   primaryBtn: {
     backgroundColor: '#3498DB',
