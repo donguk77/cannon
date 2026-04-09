@@ -195,6 +195,7 @@ class AppStudioMainWindow(QMainWindow):
             from gui.tab_report    import ReportTab
             from gui.tab_guide     import GuideTab
             from gui.tab_labeling  import LabelingTab
+            from gui.tab_mobile    import MobileTab
         except ImportError as e:
             print(f"[경고] 탭 임포트 실패: {e}")
             class _Dummy(QWidget):
@@ -209,6 +210,7 @@ class AppStudioMainWindow(QMainWindow):
             ReportTab    = lambda: _Dummy("📊  결재 대시보드 탭 준비 중...")
             GuideTab     = lambda: _Dummy("📖  파라미터 가이드 준비 중...")
             LabelingTab  = lambda: _Dummy("🏷  정답 라벨링 준비 중...")
+            MobileTab    = lambda: _Dummy("📱  모바일 앱 탭 준비 중...")
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -228,11 +230,13 @@ class AppStudioMainWindow(QMainWindow):
         self.report_tab    = ReportTab()
         self.guide_tab     = GuideTab()
         self.labeling_tab  = LabelingTab()
+        self.mobile_tab    = MobileTab()
         self.tabs.addTab(self.monitor_tab,   "  🎥  실시간 관제 (Track A)  ")
         self.tabs.addTab(self.training_tab,  "  🌙  야간 학습 지시 (Track B)  ")
         self.tabs.addTab(self.report_tab,    "  📊  아침 결재 대시보드  ")
         self.tabs.addTab(self.labeling_tab,  "  🏷  정답 라벨링  ")
         self.tabs.addTab(self.guide_tab,     "  📖  파라미터 가이드  ")
+        self.tabs.addTab(self.mobile_tab,    "  📱  모바일 앱  ")
         root_layout.addWidget(self.tabs, stretch=1)
 
         # 3. 하단 E-STOP
