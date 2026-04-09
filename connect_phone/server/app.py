@@ -27,6 +27,7 @@ connect_phone/server/app.py
     }
 """
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -51,8 +52,9 @@ _pipeline = None
 class Pipeline:
     """기존 engine/ 모듈을 그대로 사용하는 처리 파이프라인."""
 
-    RESIZE_W = 640
+    RESIZE_W = 640   # ORB 처리용 고정 크기
     RESIZE_H = 360
+    DISPLAY_MAX = 640  # 디스플레이용 최대 해상도 (종횡비 유지)
 
     def __init__(self):
         from engine.preprocessor import ImagePreprocessor
@@ -127,7 +129,12 @@ class Pipeline:
 
         fh, fw = frame.shape[:2]
 
-        # ① YOLO 크롭
+        # 디스플레이용: 종횡비 유지하며 축소
+        scale_d = self.DISPLAY_MAX / max(fw, fh)
+        dw, dh  = max(1, int(fw * scale_d)), max(1, int(fh * scale_d))
+        display_frame = cv2.resize(frame, (dw, dh))
+
+        # ① YOLO 크롭 (ORB 처리용 고정 640×360)
         analysis = cv2.resize(frame, (self.RESIZE_W, self.RESIZE_H))
         raw_corners = None
         if self.detector:
@@ -203,6 +210,33 @@ class Pipeline:
         if raw_corners is not None:
             corners = [[float(x / fw), float(y / fh)] for x, y in raw_corners]
 
+        # ⑥ 원본 종횡비 디스플레이 프레임에 어노테이션
+        color_bgr = (83, 200, 0) if best_ok else (68, 23, 255)   # BGR: 초록/빨강
+
+        # YOLO 폴리곤 (원본 좌표 → 디스플레이 좌표)
+        if raw_corners is not None:
+            sd = np.array([scale_d, scale_d])
+            scaled_d = (raw_corners * sd).astype(np.int32)
+            cv2.polylines(display_frame, [scaled_d.reshape(-1, 1, 2)], True, color_bgr, 3, cv2.LINE_AA)
+            for pt in scaled_d:
+                cv2.circle(display_frame, tuple(pt), 7, color_bgr, -1)
+
+        # PASS / FAIL 텍스트
+        font_scale = max(0.6, dh / 480)
+        label = f"PASS  Target {best_tid}" if best_ok else "FAIL"
+        cv2.putText(display_frame, label, (14, int(dh * 0.07)),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale * 1.2, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(display_frame, label, (14, int(dh * 0.07)),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale * 1.2, color_bgr, 2, cv2.LINE_AA)
+        if best_total > 0:
+            sub = f"ROI {best_passed}/{best_total}  score {best_score}"
+            cv2.putText(display_frame, sub, (14, int(dh * 0.12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.65, (220, 220, 220), 1, cv2.LINE_AA)
+
+        # JPEG 인코딩 → base64
+        _, enc = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        frame_b64 = base64.b64encode(enc).decode('ascii')
+
         processing_ms = (time.perf_counter() - t_start) * 1000
         return {
             "status":        "pass" if best_ok else "fail",
@@ -212,6 +246,7 @@ class Pipeline:
             "roi_total":     best_total,
             "corners":       corners,
             "processing_ms": round(processing_ms, 1),
+            "frame":         frame_b64,
         }
 
 

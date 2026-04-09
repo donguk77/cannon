@@ -42,18 +42,19 @@ export async function autoDiscoverServer(): Promise<string | null> {
 
     // 전체 동시 탐색 — 첫 성공이 즉시 반환
     return await new Promise<string | null>((resolve) => {
-      let pending = hosts.length;
+      let completed = 0;
       let won = false;
+      const total = hosts.length;
 
       for (const host of hosts) {
         probeHost(host).then(result => {
-          if (won) return;
+          if (won) { completed++; return; }
           if (result) {
             won = true;
             resolve(result);
           } else {
-            pending--;
-            if (pending === 0) resolve(null);
+            completed++;
+            if (completed === total) resolve(null);
           }
         });
       }
