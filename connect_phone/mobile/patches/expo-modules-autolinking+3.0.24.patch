@@ -1,0 +1,27 @@
+diff --git a/node_modules/expo-modules-autolinking/android/expo-gradle-plugin/expo-autolinking-plugin-shared/build.gradle.kts b/node_modules/expo-modules-autolinking/android/expo-gradle-plugin/expo-autolinking-plugin-shared/build.gradle.kts
+index 3aca925..983cf70 100644
+--- a/node_modules/expo-modules-autolinking/android/expo-gradle-plugin/expo-autolinking-plugin-shared/build.gradle.kts
++++ b/node_modules/expo-modules-autolinking/android/expo-gradle-plugin/expo-autolinking-plugin-shared/build.gradle.kts
+@@ -8,6 +8,8 @@ plugins {
+ 
+ repositories {
+   mavenCentral()
++  // Fallback mirror: Maven Central 429 rate-limit 대응
++  maven { url = uri("https://cache-redirector.jetbrains.com/maven-central") }
+ }
+ 
+ dependencies {
+diff --git a/node_modules/expo-modules-autolinking/android/expo-gradle-plugin/settings.gradle.kts b/node_modules/expo-modules-autolinking/android/expo-gradle-plugin/settings.gradle.kts
+index 7cd378f..38323fd 100644
+--- a/node_modules/expo-modules-autolinking/android/expo-gradle-plugin/settings.gradle.kts
++++ b/node_modules/expo-modules-autolinking/android/expo-gradle-plugin/settings.gradle.kts
+@@ -3,6 +3,9 @@ pluginManagement {
+     mavenCentral()
+     google()
+     gradlePluginPortal()
++    // Fallback mirror: Maven Central 429 rate-limit 대응
++    maven { url = uri("https://cache-redirector.jetbrains.com/maven-central") }
++    maven { url = uri("https://jitpack.io") }
+   }
+ }
+ 
