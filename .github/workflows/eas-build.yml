@@ -1,0 +1,36 @@
+name: EAS Build (Android APK)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'connect_phone/mobile/**'
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: npm
+          cache-dependency-path: connect_phone/mobile/package-lock.json
+
+      - name: Install EAS CLI
+        run: npm install -g eas-cli
+
+      - name: Install dependencies
+        working-directory: connect_phone/mobile
+        run: npm ci
+
+      - name: Build Android APK via EAS
+        working-directory: connect_phone/mobile
+        run: eas build --platform android --profile preview --non-interactive
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
