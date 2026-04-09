@@ -103,17 +103,23 @@ def _fetch_latest_apk_url(token: str) -> str | None:
 def _make_qr_pixmap(url: str, size: int = 240) -> QPixmap | None:
     try:
         import qrcode
-        qr = qrcode.QRCode(version=1, box_size=6, border=3)
+        from PIL import Image as PilImage
+        qr = qrcode.QRCode(version=1, box_size=8, border=3)
         qr.add_data(url)
         qr.make(fit=True)
-        img = qr.make_image(fill_color="#2C3E50", back_color="white")
+        img = qr.make_image(fill_color="black", back_color="white")
+        # 1-bit 이미지를 RGB로 변환해야 PyQt5에서 정상 표시됨
+        rgb = img.get_image().convert("RGB")
         buf = BytesIO()
-        img.save(buf, format="PNG")
+        rgb.save(buf, format="PNG")
         buf.seek(0)
         pm = QPixmap()
-        pm.loadFromData(buf.read())
+        ok = pm.loadFromData(buf.read())
+        if not ok or pm.isNull():
+            return None
         return pm.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    except Exception:
+    except Exception as e:
+        print(f"[QR] 생성 실패: {e}")
         return None
 
 
@@ -356,10 +362,13 @@ class MobileTab(QWidget):
             return
 
         self._apk_url = url
-        pm = _make_qr_pixmap(url, 240)
-        if pm:
-            self.qr_label.setPixmap(pm)
         self.url_label.setText(url[:60] + ("..." if len(url) > 60 else ""))
+        pm = _make_qr_pixmap(url, 240)
+        if pm and not pm.isNull():
+            self.qr_label.clear()
+            self.qr_label.setPixmap(pm)
+        else:
+            self.qr_label.setText("QR 생성 실패\n콘솔 로그를 확인하세요")
 
     def _start_server(self):
         if self._server_proc and self._server_proc.poll() is None:
