@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import {
   View, TouchableOpacity, Text, StyleSheet,
-  Dimensions, SafeAreaView, ActivityIndicator, Image,
+  Dimensions, SafeAreaView, ActivityIndicator,
 } from 'react-native';
 import {
   Camera,
@@ -206,9 +206,11 @@ function CameraContent({ serverUrl, onOpenSettings }: Props) {
     );
   }
 
-  const isConnected  = wsState === 'connected';
-  const showCamera   = mode !== 'file';
-  const showResult   = isConnected && !!result?.frame;
+  const isConnected = wsState === 'connected';
+  const showCamera  = mode !== 'file';
+  // 서버는 frame 필드를 보내지 않는다 — result 자체의 유무로 판단
+  // zombie-stabilize: 새 프레임을 보내는 중에도 마지막 result를 그대로 유지
+  const overlayResult = isConnected ? result : null;
 
   // ── 레터박스 카메라 크기 (16:9, 전체 너비 기준) ─────────────────────────
   // aspectRatio = width/height. portrait에서 9:16 → 9/16
@@ -258,18 +260,8 @@ function CameraContent({ serverUrl, onOpenSettings }: Props) {
             />
           )}
 
-          {/* 서버 분석 결과 프레임 */}
-          {showResult && (
-            <Image
-              source={{ uri: `data:image/jpeg;base64,${result!.frame}` }}
-              style={StyleSheet.absoluteFill}
-              resizeMode="cover"
-              fadeDuration={0}
-            />
-          )}
-
           {/* 파일 모드 — 아직 결과 없을 때 안내 */}
-          {mode === 'file' && !showResult && (
+          {mode === 'file' && !overlayResult && (
             <View style={styles.filePlaceholder}>
               <Text style={styles.filePlaceholderIcon}>📁</Text>
               <Text style={styles.filePlaceholderText}>
@@ -279,7 +271,7 @@ function CameraContent({ serverUrl, onOpenSettings }: Props) {
           )}
 
           {/* 실시간 모드 — 시작 전 대기 안내 */}
-          {mode === 'live' && !streaming && !showResult && (
+          {mode === 'live' && !streaming && (
             <View style={styles.filePlaceholder}>
               <Text style={styles.filePlaceholderIcon}>🎥</Text>
               <Text style={styles.filePlaceholderText}>
@@ -288,9 +280,13 @@ function CameraContent({ serverUrl, onOpenSettings }: Props) {
             </View>
           )}
 
-          {/* OverlayView (연결 상태 + PASS/FAIL 배지 + 폴리곤) */}
+          {/* OverlayView — zombie stabilize
+              라이브 카메라를 배경으로 유지하면서, 마지막으로 받은 서버 결과를
+              다음 결과가 올 때까지 그대로 표시한다.
+              프레임 전송 중에도 overlayResult는 바뀌지 않으므로
+              오버레이가 깜빡이지 않고 영상처럼 보인다. */}
           <OverlayView
-            result={showResult ? result : null}
+            result={overlayResult}
             wsState={wsState}
             latencyMs={latencyMs}
             cameraWidth={SCREEN_W}
