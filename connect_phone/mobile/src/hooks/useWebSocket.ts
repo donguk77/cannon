@@ -8,7 +8,6 @@ export type MatchResult = {
   roi_total: number;
   corners: [number, number][] | null;  // 0~1 정규화 좌표
   processing_ms: number;
-  frame: string | null;                // base64 JPEG (서버 어노테이션 프레임)
 };
 
 export type WsState = 'connecting' | 'connected' | 'disconnected';

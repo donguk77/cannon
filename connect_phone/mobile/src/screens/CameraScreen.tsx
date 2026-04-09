@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import {
   View, TouchableOpacity, Text, StyleSheet,
-  Dimensions, SafeAreaView, Image,
+  Dimensions, SafeAreaView,
 } from 'react-native';
 import {
   Camera,
@@ -9,13 +9,15 @@ import {
   useCameraPermission,
   useCameraFormat,
 } from 'react-native-vision-camera';
+import OverlayView from '../components/OverlayView';
 import { useWebSocket } from '../hooks/useWebSocket';
 
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
 
-// 전송 간격 (ms) — takeSnapshot은 takePictureAsync보다 훨씬 빠름
-const SEND_INTERVAL_MS = 150;   // ~6fps
-const JPEG_QUALITY     = 50;    // 0~100
+// 서버 전송 주기 (카메라는 30fps 그대로 표시, 서버에는 이 속도로만 전송)
+const SEND_INTERVAL_MS = 200; // 5fps → 서버 부하 낮춤
+const JPEG_QUALITY     = 50;
+const ZOOM_STEP        = 0.5;
 
 type Props = {
   serverUrl: string;
@@ -24,61 +26,62 @@ type Props = {
 
 export default function CameraScreen({ serverUrl, onOpenSettings }: Props) {
   const { hasPermission, requestPermission } = useCameraPermission();
-  const [facing, setFacing]  = useState<'back' | 'front'>('back');
-  const device               = useCameraDevice(facing);
-  const cameraRef            = useRef<Camera>(null);
-  const isSendingRef         = useRef(false);
-  const intervalRef          = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [facing,   setFacing]  = useState<'back' | 'front'>('back');
+  const [zoom,     setZoom]    = useState(1);
+  const [torch,    setTorch]   = useState<'off' | 'on'>('off');
 
-  // 캡처 해상도 낮춰서 속도 향상
+  const device      = useCameraDevice(facing);
+  const cameraRef   = useRef<Camera>(null);
+  const sendingRef  = useRef(false);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const minZoom = device?.minZoom ?? 1;
+  const maxZoom = Math.min(device?.maxZoom ?? 8, 8);
+
+  // 720p로 고정 (snapshot 속도 / 정확도 균형)
   const format = useCameraFormat(device, [
     { videoResolution: { width: 1280, height: 720 } },
   ]);
 
   const { wsState, result, latencyMs, sendFrame } = useWebSocket(serverUrl);
 
-  // 주기적으로 스냅샷 캡처 → 전송
+  // ── 프레임 전송 루프 ─────────────────────────────────────────────────────
+  // 카메라 뷰는 항상 30fps로 표시됨. 여기서는 서버로 보낼 프레임만 제어.
   const startCapture = useCallback(() => {
     if (intervalRef.current) clearInterval(intervalRef.current);
     intervalRef.current = setInterval(async () => {
-      if (isSendingRef.current || wsState !== 'connected') return;
+      if (sendingRef.current || wsState !== 'connected') return;
       if (!cameraRef.current) return;
-
-      isSendingRef.current = true;
+      sendingRef.current = true;
       try {
-        // takeSnapshot: 셔터 없이 현재 프레임 버퍼에서 즉시 캡처 (takePictureAsync보다 훨씬 빠름)
-        const snapshot = await cameraRef.current.takeSnapshot({
+        const snap = await cameraRef.current.takeSnapshot({
           quality: JPEG_QUALITY,
           skipMetadata: true,
         });
-
-        // 파일 경로 → ArrayBuffer → Uint8Array
-        const uri  = snapshot.path.startsWith('file://') ? snapshot.path : `file://${snapshot.path}`;
+        const uri  = snap.path.startsWith('file://') ? snap.path : `file://${snap.path}`;
         const resp = await fetch(uri);
         const buf  = await resp.arrayBuffer();
         sendFrame(new Uint8Array(buf));
       } catch (_) {
       } finally {
-        isSendingRef.current = false;
+        sendingRef.current = false;
       }
     }, SEND_INTERVAL_MS);
   }, [wsState, sendFrame]);
 
   useEffect(() => {
     startCapture();
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
   }, [startCapture]);
 
-  // 권한 미허가
+  // ── 권한 미허가 ──────────────────────────────────────────────────────────
   if (!hasPermission) {
     return (
       <SafeAreaView style={styles.container}>
-        <View style={styles.permBox}>
-          <Text style={styles.permText}>카메라 권한이 필요합니다</Text>
-          <TouchableOpacity style={styles.permBtn} onPress={requestPermission}>
-            <Text style={styles.permBtnText}>권한 허용</Text>
+        <View style={styles.centerBox}>
+          <Text style={styles.msgText}>카메라 권한이 필요합니다</Text>
+          <TouchableOpacity style={styles.primaryBtn} onPress={requestPermission}>
+            <Text style={styles.primaryBtnText}>권한 허용</Text>
           </TouchableOpacity>
         </View>
       </SafeAreaView>
@@ -88,81 +91,85 @@ export default function CameraScreen({ serverUrl, onOpenSettings }: Props) {
   if (!device) {
     return (
       <View style={styles.container}>
-        <Text style={{ color: '#fff', textAlign: 'center', marginTop: 100 }}>
-          카메라를 찾을 수 없습니다
-        </Text>
+        <View style={styles.centerBox}>
+          <Text style={styles.msgText}>카메라를 찾을 수 없습니다</Text>
+        </View>
       </View>
     );
   }
 
-  const isConnected = wsState === 'connected';
-  const isPass      = result?.status === 'pass';
-  const dotColor    = wsState === 'connected'  ? '#00E676'
-                    : wsState === 'connecting' ? '#FFAB00' : '#FF1744';
-  const connLabel   = wsState === 'connected'  ? '연결됨'
-                    : wsState === 'connecting' ? '연결 중...' : '연결 끊김';
-
   return (
     <View style={styles.container}>
 
-      {/* ── 캡처 전용 카메라 (화면에 보이지 않음) ── */}
+      {/* ── 라이브 카메라 (항상 30fps 표시) ─────────────────────────────── */}
       <Camera
         ref={cameraRef}
-        style={styles.hiddenCamera}
+        style={StyleSheet.absoluteFill}
         device={device}
         format={format}
         isActive={true}
         photo={true}
+        zoom={zoom}
+        torch={torch}
       />
 
-      {/* ── 메인 디스플레이: 서버 분석 결과 프레임 ── */}
-      {result?.frame && isConnected ? (
-        <Image
-          source={{ uri: `data:image/jpeg;base64,${result.frame}` }}
-          style={styles.serverFrame}
-          resizeMode="contain"
-          fadeDuration={0}
-        />
-      ) : (
-        <View style={styles.waitScreen}>
-          <View style={[styles.dot, { backgroundColor: dotColor }]} />
-          <Text style={styles.waitText}>{connLabel}</Text>
-          {wsState === 'connected' && (
-            <Text style={styles.waitSub}>서버 분석 대기 중...</Text>
-          )}
-        </View>
-      )}
+      {/* ── 결과 오버레이 (SVG 코너 + PASS/FAIL 배지) ────────────────────── */}
+      <OverlayView
+        result={result}
+        wsState={wsState}
+        latencyMs={latencyMs}
+        cameraWidth={SCREEN_W}
+        cameraHeight={SCREEN_H}
+      />
 
-      {/* ── 상단 상태 바 ── */}
-      <SafeAreaView style={styles.topBar} pointerEvents="none">
-        <View style={styles.statusRow}>
-          <View style={[styles.dot, { backgroundColor: dotColor }]} />
-          <Text style={styles.statusText}>{connLabel}</Text>
-          {isConnected && latencyMs > 0 && (
-            <Text style={styles.latency}>{latencyMs.toFixed(0)}ms</Text>
-          )}
-          {result && isConnected && (
-            <View style={[styles.badge, { backgroundColor: isPass ? '#00C853' : '#D50000' }]}>
-              <Text style={styles.badgeText}>
-                {isPass ? `✓ PASS  Target ${result.target_id}` : '✗ FAIL'}
-              </Text>
-            </View>
-          )}
-        </View>
-      </SafeAreaView>
-
-      {/* ── 하단 컨트롤 바 ── */}
+      {/* ── 하단 컨트롤 바 ────────────────────────────────────────────────── */}
       <SafeAreaView style={styles.controlBar} pointerEvents="box-none">
         <View style={styles.controls}>
+
+          {/* 카메라 반전 */}
           <TouchableOpacity
             style={styles.ctrlBtn}
             onPress={() => setFacing(f => f === 'back' ? 'front' : 'back')}
           >
             <Text style={styles.ctrlIcon}>🔄</Text>
           </TouchableOpacity>
+
+          {/* 줌 축소 */}
+          <TouchableOpacity
+            style={[styles.ctrlBtn, zoom <= minZoom && styles.ctrlBtnDisabled]}
+            onPress={() => setZoom(z => Math.max(z - ZOOM_STEP, minZoom))}
+            disabled={zoom <= minZoom}
+          >
+            <Text style={styles.ctrlIcon}>➖</Text>
+          </TouchableOpacity>
+
+          {/* 줌 레벨 표시 */}
+          <View style={styles.zoomBadge}>
+            <Text style={styles.zoomText}>{zoom.toFixed(1)}×</Text>
+          </View>
+
+          {/* 줌 확대 */}
+          <TouchableOpacity
+            style={[styles.ctrlBtn, zoom >= maxZoom && styles.ctrlBtnDisabled]}
+            onPress={() => setZoom(z => Math.min(z + ZOOM_STEP, maxZoom))}
+            disabled={zoom >= maxZoom}
+          >
+            <Text style={styles.ctrlIcon}>➕</Text>
+          </TouchableOpacity>
+
+          {/* 토치 */}
+          <TouchableOpacity
+            style={[styles.ctrlBtn, torch === 'on' && styles.ctrlBtnActive]}
+            onPress={() => setTorch(t => t === 'off' ? 'on' : 'off')}
+          >
+            <Text style={styles.ctrlIcon}>🔦</Text>
+          </TouchableOpacity>
+
+          {/* 설정 */}
           <TouchableOpacity style={styles.ctrlBtn} onPress={onOpenSettings}>
             <Text style={styles.ctrlIcon}>⚙️</Text>
           </TouchableOpacity>
+
         </View>
       </SafeAreaView>
     </View>
@@ -174,69 +181,26 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#000',
   },
-  hiddenCamera: {
-    position: 'absolute',
-    width: SCREEN_W,
-    height: SCREEN_H,
-    opacity: 0,
-  },
-  serverFrame: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: '#000',
-  },
-  waitScreen: {
+  centerBox: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    gap: 12,
+    gap: 16,
     backgroundColor: '#0d0d1a',
   },
-  waitText: {
+  msgText: {
     color: '#fff',
-    fontSize: 18,
-    fontWeight: '600',
+    fontSize: 16,
   },
-  waitSub: {
-    color: '#888',
-    fontSize: 13,
+  primaryBtn: {
+    backgroundColor: '#3498DB',
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 8,
   },
-  topBar: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-  },
-  statusRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flexWrap: 'wrap',
-    gap: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    backgroundColor: 'rgba(0,0,0,0.55)',
-  },
-  dot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-  },
-  statusText: {
+  primaryBtnText: {
     color: '#fff',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  latency: {
-    color: '#aaa',
-    fontSize: 11,
-  },
-  badge: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 6,
-  },
-  badgeText: {
-    color: '#fff',
-    fontSize: 13,
+    fontSize: 14,
     fontWeight: 'bold',
   },
   controlBar: {
@@ -249,41 +213,39 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-around',
     alignItems: 'center',
-    paddingVertical: 16,
-    paddingHorizontal: 40,
-    backgroundColor: 'rgba(0,0,0,0.55)',
+    paddingVertical: 14,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(0,0,0,0.6)',
   },
   ctrlBtn: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
     backgroundColor: 'rgba(255,255,255,0.12)',
     justifyContent: 'center',
     alignItems: 'center',
   },
+  ctrlBtnDisabled: {
+    opacity: 0.3,
+  },
+  ctrlBtnActive: {
+    backgroundColor: 'rgba(255, 200, 0, 0.35)',
+  },
   ctrlIcon: {
-    fontSize: 22,
+    fontSize: 20,
   },
-  permBox: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    gap: 16,
-    backgroundColor: '#0d0d1a',
-  },
-  permText: {
-    color: '#fff',
-    fontSize: 16,
-  },
-  permBtn: {
-    backgroundColor: '#3498DB',
-    paddingHorizontal: 24,
-    paddingVertical: 12,
+  zoomBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
     borderRadius: 8,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    minWidth: 48,
+    alignItems: 'center',
   },
-  permBtnText: {
+  zoomText: {
     color: '#fff',
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: 'bold',
+    fontVariant: ['tabular-nums'],
   },
 });
