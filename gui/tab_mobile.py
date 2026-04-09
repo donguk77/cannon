@@ -54,19 +54,47 @@ def _save_token(token: str):
 
 
 def _fetch_latest_apk_url(token: str) -> str | None:
-    """EAS API로 최신 Android APK 다운로드 URL을 가져온다."""
+    """EAS GraphQL API로 최신 완료된 Android APK 다운로드 URL을 가져온다."""
     try:
         import requests as req
-        headers = {"Authorization": f"Bearer {token}"}
-        url = (
-            f"https://api.expo.dev/v2/projects/{EAS_PROJECT_ID}/builds"
-            f"?platform=ANDROID&status=FINISHED&limit=1"
+        import warnings
+        warnings.filterwarnings("ignore")
+
+        query = """
+        {
+          app {
+            byId(appId: "%s") {
+              builds(platform: ANDROID, limit: 5, offset: 0) {
+                status
+                artifacts { buildUrl }
+              }
+            }
+          }
+        }
+        """ % EAS_PROJECT_ID
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        resp = req.post(
+            "https://api.expo.dev/graphql",
+            headers=headers,
+            json={"query": query},
+            timeout=15,
         )
-        resp = req.get(url, headers=headers, timeout=10)
         data = resp.json()
-        builds = data.get("data", [])
-        if builds:
-            return builds[0].get("artifacts", {}).get("buildUrl")
+        builds = (
+            data.get("data", {})
+                .get("app", {})
+                .get("byId", {})
+                .get("builds", [])
+        )
+        for build in builds:
+            if build.get("status") == "FINISHED":
+                url = build.get("artifacts", {}).get("buildUrl")
+                if url:
+                    return url
     except Exception:
         pass
     return None
