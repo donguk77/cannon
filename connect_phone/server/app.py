@@ -82,6 +82,8 @@ class Pipeline:
 
         self.ROI_MATCH_THRESHOLD = int(cfg.get("roi_match_threshold", 7))
         self.MATCH_THRESHOLD     = int(cfg.get("MATCH_THRESHOLD", 60))
+        # 폰 카메라는 각도·조명 변화가 크므로 기본값을 0.3으로 낮춤
+        yolo_conf = float(cfg.get("yolo_conf", 0.3))
 
         # YOLO 탐지기 (없으면 ORB 단독 모드)
         self.detector = None
@@ -89,8 +91,8 @@ class Pipeline:
             from engine.detector import BezelDetector
             model_path = os.path.join(_ROOT, "models", "canon_fast_yolo", "weights", "best.pt")
             if os.path.isfile(model_path):
-                self.detector = BezelDetector(model_path=model_path)
-                print(f"[Pipeline] YOLO 로드: {os.path.basename(model_path)}")
+                self.detector = BezelDetector(model_path=model_path, conf_threshold=yolo_conf)
+                print(f"[Pipeline] YOLO 로드: {os.path.basename(model_path)}  conf={yolo_conf}")
             else:
                 print("[Pipeline] best.pt 없음 → ORB 단독 모드")
         except Exception as e:
@@ -130,14 +132,18 @@ class Pipeline:
         # ① YOLO 크롭 (ORB 처리용 고정 640×360)
         analysis = cv2.resize(frame, (self.RESIZE_W, self.RESIZE_H))
         raw_corners = None
+        yolo_hit = False
         if self.detector:
             try:
                 cropped, _ = self.detector.detect_and_crop(frame)
                 if cropped is not None and cropped.size > 0:
                     analysis = cv2.resize(cropped, (self.RESIZE_W, self.RESIZE_H))
-                    raw_corners = self.detector.last_corners  # (4,2) float32 원본좌표
-            except Exception:
-                pass
+                    raw_corners = self.detector.last_corners
+                    yolo_hit = True
+                else:
+                    print(f"[Pipeline] YOLO 미감지 (frame {fw}×{fh}) → 전체 프레임 ORB")
+            except Exception as e:
+                print(f"[Pipeline] YOLO 예외 (frame {fw}×{fh}): {e}")
 
         # ② 전처리
         orb_ready = self.preprocessor.preprocess_for_orb(analysis)
@@ -167,7 +173,10 @@ class Pipeline:
             n_rois = t_data.get("n_rois", 0)
 
             if n_rois == 0:
-                s, p = self.matcher.compare_descriptors(full_des_cache, t_data.get("full"))
+                # full-image 모드: MATCH_THRESHOLD 적용 (match_threshold와 구분)
+                s, p = self.matcher.compare_descriptors(
+                    full_des_cache, t_data.get("full"),
+                    threshold=self.MATCH_THRESHOLD)
                 return tid, 1, s, (1 if p else 0), p
 
             passed = 0
@@ -204,6 +213,8 @@ class Pipeline:
             corners = [[float(x / fw), float(y / fh)] for x, y in raw_corners]
 
         processing_ms = (time.perf_counter() - t_start) * 1000
+        print(f"[Pipeline] yolo={'hit' if yolo_hit else 'miss'}  "
+              f"score={best_score}  ok={best_ok}  {processing_ms:.0f}ms")
         return {
             "status":        "pass" if best_ok else "fail",
             "target_id":     best_tid if best_ok else None,
@@ -212,6 +223,7 @@ class Pipeline:
             "roi_total":     best_total,
             "corners":       corners,
             "processing_ms": round(processing_ms, 1),
+            "yolo_hit":      yolo_hit,
         }
 
 
