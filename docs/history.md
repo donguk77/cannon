@@ -1,3 +1,57 @@
+## [2026-04-09 22:00] ⚡ 파라미터 저장 즉시 반영 — 분석 재시작 없이 다음 프레임부터 적용
+
+### 💬 논의 및 결정 사항
+- **기존 문제**: 파라미터 가이드 탭에서 저장 후 "영상 분석을 다시 시작할 때 적용됩니다" 라는 메시지. 실행 중인 분석에는 즉시 적용되지 않음.
+- **질문**: 즉시 반영이 가능한지?
+- **결정**: `_reload_requested` 플래그 패턴 도입. 저장 시 플래그를 세우고, VideoThread 루프의 다음 프레임 시작 전에 체크하여 preprocessor/matcher/thresholds를 재초기화.
+
+### 🛠️ 코드 수정 내역
+- **Changed**: `gui/tab_monitor.py`
+  - `VideoThread.__init__`: `_reload_requested`, `_match_threshold`, `_roi_match_threshold` 인스턴스 변수 추가
+  - `VideoThread.reload_params()`: 외부에서 플래그를 세우는 public 메서드 추가
+  - `VideoThread._apply_reload_params()`: 파일 재읽기 → preprocessor/matcher/thresholds 재초기화 + 타겟 특징점 재로드
+  - `VideoThread.run()` 루프: `_reload_requested` 체크 블록 추가 (일시정지 체크 직후)
+  - 루프 내 로컬 변수 `ROI_MATCH_THRESHOLD` → `self._roi_match_threshold`, `MATCH_THRESHOLD` → `self._match_threshold` 로 교체
+  - `LiveMonitorSubTab.on_params_reloaded()`: `_thread.reload_params()` 호출 메서드 추가
+  - `MonitorTab`: `self.live_tab` 참조 저장, `on_params_reloaded()` 포워딩 메서드 추가
+- **Changed**: `gui/tab_guide.py`
+  - `GuideTab.params_saved = pyqtSignal()` 추가
+  - `_on_save()`: 저장 성공 후 `self.params_saved.emit()` 호출
+  - 저장 완료 메시지: "다시 시작할 때" → "다음 프레임부터 즉시 반영됩니다"
+- **Changed**: `gui/main_window.py`
+  - `guide_tab.params_saved` → `monitor_tab.on_params_reloaded` 연결 (시그널/슬롯)
+
+### 📝 반영 흐름
+```
+[파라미터 가이드] 저장 버튼
+  → params_saved 시그널 emit
+  → MonitorTab.on_params_reloaded()
+  → LiveMonitorSubTab.on_params_reloaded()
+  → VideoThread._reload_requested = True
+  → [다음 프레임 시작 전] _apply_reload_params() 실행
+      - ImagePreprocessor 재초기화 (clahe/blur/gamma/sharpen)
+      - ScreenMatcher 재초기화 (nfeatures/lowe_ratio/match_threshold)
+      - roi_match_threshold, match_threshold 갱신
+      - 타겟 특징점 재로드
+  → 즉시 반영 완료
+```
+
+### 📊 성능 영향 분석
+| 항목 | 영향 | 이유 |
+|------|------|------|
+| 평상시 프레임 처리 | **없음** | `if self._reload_requested:` 단일 bool 비교 (Python GIL 보호, 사실상 0 오버헤드) |
+| 저장 버튼 누른 직후 | **약 100~500ms 1회** | ORB 특징점 재계산 + 타겟 이미지 재로드. 타겟 수에 비례 |
+| 스레드 안전성 | **문제없음** | 플래그 bool 쓰기/읽기는 Python GIL이 원자적으로 보호 |
+| 저장을 여러 번 빠르게 | **마지막 설정만 적용** | 플래그가 이미 True인 상태에서 다시 True → 문제없음 |
+
+### 🐛 시행착오
+| 문제 | 원인 | 해결 |
+|------|------|------|
+| `ROI_MATCH_THRESHOLD`가 루프 내 로컬 변수 | `run()` 시작 시 1회만 할당됨 → 재초기화해도 루프에 미반영 | 인스턴스 변수(`self._roi_match_threshold`)로 전환 |
+| 같은 패턴의 `_paused` 체크가 2곳 존재 (`VideoThread`, `SiameseThread`) | Edit 시 중복 매칭 오류 | 더 긴 컨텍스트로 특정 위치만 수정 |
+
+---
+
 ## [2026-04-09 21:00] 📱 카메라 UI 개편 — 레터박스 16:9 + 모드 선택 (사진/파일/실시간) + 시작/정지 버튼
 
 ### 💬 논의 및 결정 사항
