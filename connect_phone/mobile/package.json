@@ -17,7 +17,7 @@
     "react": "19.1.0",
     "react-native": "0.81.5",
     "react-native-svg": "15.12.1",
-    "react-native-vision-camera": "^4.6.4"
+    "react-native-vision-camera": "4.7.3"
   },
   "devDependencies": {
     "@babel/core": "^7.24.0",
