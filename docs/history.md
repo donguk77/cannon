@@ -1,3 +1,49 @@
+## [2026-04-09 19:00] 📷 카메라 깜빡임 수정 — 라이브 프리뷰 + SVG 오버레이 + 줌/토치 추가
+
+### 💬 논의 및 결정 사항
+- **문제**: 카메라가 눈에 띄게 깜빡임. `opacity:0` 으로 숨긴 카메라로 `takeSnapshot()` 후 서버 어노테이션 JPEG를 `<Image>`로 표시하는 구조여서 Image source가 교체될 때마다 리렌더 → 깜빡임 발생.
+- **결정**: 카메라를 항상 fullscreen으로 표시(30fps 그대로), 서버는 JSON만 반환, 기존에 만들어진 `OverlayView.tsx` (SVG 코너 폴리곤 + PASS/FAIL 배지)를 올려서 연결.
+- **추가 의견**: VisionCamera `zoom` prop으로 별도 패키지 없이 줌 버튼 구현 가능 → 줌 +/- 버튼 및 토치 버튼도 함께 추가.
+- **Android cleartext 차단 버그도 함께 수정**: Android 9+는 `ws://` 연결을 기본 차단 → `usesCleartextTraffic: true` 추가.
+
+### 🛠️ 코드 수정 내역
+- **Changed**: `connect_phone/mobile/src/screens/CameraScreen.tsx`
+  - 카메라 `opacity:0` 제거 → `StyleSheet.absoluteFill` 로 항상 표시
+  - 서버 base64 JPEG `<Image>` 표시 제거
+  - `OverlayView` 컴포넌트 연결 (SVG 코너 + PASS/FAIL 배지)
+  - 줌 ➕➖ 버튼 추가 (`device.minZoom` ~ `device.maxZoom`, 0.5× 단위)
+  - 토치 🔦 버튼 추가
+  - 서버 전송 주기 150ms → 200ms (카메라 표시는 30fps 그대로)
+- **Changed**: `connect_phone/server/app.py`
+  - 프레임 어노테이션(cv2 드로잉) + JPEG 인코딩 + base64 변환 제거
+  - JSON 결과만 반환 → 처리 속도 ↑, WebSocket 페이로드 대폭 감소
+- **Changed**: `connect_phone/mobile/src/hooks/useWebSocket.ts`
+  - `MatchResult` 타입에서 `frame: string | null` 필드 제거
+- **Changed**: `connect_phone/mobile/app.json`
+  - `expo-build-properties` android에 `usesCleartextTraffic: true` 추가 (Android 9+ ws:// 차단 해제)
+- **Changed**: `connect_phone/mobile/src/utils/discovery.ts`
+  - 경쟁 조건 수정: `pending` → `completed` 카운터로 통합하여 성공/실패 모두 카운트 → 모든 실패가 먼저 완료되더라도 `resolve(null)` 조기 발화 방지
+
+### 🐛 시행착오
+| 문제 | 원인 | 해결 |
+|------|------|------|
+| 서버 연결 시도조차 안 됨 | Android 9+가 `ws://` cleartext 기본 차단 | `app.json`에 `usesCleartextTraffic: true` 추가 |
+| 자동 검색이 서버 있어도 null 반환 | 253개 실패 프로브가 성공 응답보다 먼저 완료 → `pending===0` 조기 발화 | `completed` 카운터로 통합 (성공도 카운트) |
+| 카메라 깜빡임 | 숨긴 카메라 + 서버 JPEG Image 교체 방식 | 카메라 항상 표시 + SVG 오버레이로 전환 |
+
+### 📝 아키텍처 변화
+```
+이전:
+  [카메라 숨김] → takeSnapshot() → 서버 → cv2 어노테이션 → JPEG → base64 → <Image> 표시
+  → Image source 교체마다 깜빡임, 서버 처리 부하 높음
+
+이후:
+  [카메라 30fps 항상 표시] → takeSnapshot(200ms) → 서버 → JSON만 반환
+  → OverlayView가 SVG로 코너/결과 표시 → 깜빡임 없음, 페이로드 최소화
+```
+
+---
+
 ## [2026-04-09 17:00] 📱 모바일 앱 탭 GUI 추가 — APK QR 다운로드 + 서버 제어
 
 ### 💬 논의 및 결정 사항
