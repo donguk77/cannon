@@ -6,6 +6,9 @@
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
+    "androidNavigationBar": {
+      "visible": "sticky-immersive"
+    },
     "splash": {
       "backgroundColor": "#1a1a2e"
     },

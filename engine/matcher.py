@@ -11,7 +11,7 @@ class ScreenMatcher:
     잘라낸 모니터 화면이 우리가 찾는 1번(혹은 2번) 타겟 화면과 동일한지 
     '제로샷(1장만으로 비교)' 방식으로 판별하는 핵심 ORB 특징점 매칭 모듈입니다.
     """
-    def __init__(self, orb_nfeatures=700, lowe_ratio=0.75, match_threshold=25):
+    def __init__(self, orb_nfeatures=700, lowe_ratio=0.75, orb_compare_threshold=25):
         # 1. ORB (특징점 추출기)
         # 딥러닝과 달리 규칙 기반으로 빠르고 가볍게 이미지의 특징점(코너 등) 700개를 찾습니다.
         # 문서 검증 지표인 65ms 속도 제한을 맞추기 위한 극단적 경량화 세팅입니다.
@@ -22,8 +22,8 @@ class ScreenMatcher:
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
         # 3. 판별 정확도 세팅 (문서 상 'Recall 75% 방어' 달성을 위한 파라미터)
-        self.lowe_ratio = lowe_ratio           # 노이즈를 거르는 깐깐함의 척도 (Lowe's Ratio Test)
-        self.match_threshold = match_threshold # "몇 쌍 이상 똑같으면 같은 화면으로 칠래?" 라는 합격 컷오프
+        self.lowe_ratio = lowe_ratio                         # 노이즈를 거르는 깐깐함의 척도 (Lowe's Ratio Test)
+        self.orb_compare_threshold = orb_compare_threshold  # ORB 개별 비교: "몇 쌍 이상 똑같으면 같은 화면?" 컷오프
 
         # 4. 실시간 파이프라인용 전체 마스크 합집합 (load_targets_from_dir 호출 시 갱신)
         self.union_masks = []
@@ -45,13 +45,13 @@ class ScreenMatcher:
         """
         초고속 비교 전용: 이미 화면에서 뽑아둔 DNA(query_des)를 재입력받아서
         여러 타겟(1.png~4.png)과 중복 연산 없이 빠르게 매칭만 수행합니다.
-        threshold: None이면 self.match_threshold(전체 이미지 기본값) 사용.
+        threshold: None이면 self.orb_compare_threshold(ORB 개별 비교 기본값) 사용.
                    ROI 크롭용은 ROI_MATCH_THRESHOLD를 넘겨 사용.
         """
         if query_des is None or len(query_des) == 0 or target_des is None:
             return 0, False
 
-        cutoff = threshold if threshold is not None else self.match_threshold
+        cutoff = threshold if threshold is not None else self.orb_compare_threshold
 
         # KNN 매칭
         try:
@@ -70,7 +70,7 @@ class ScreenMatcher:
         score = len(good_matches)
         return score, (score >= cutoff)
 
-    def load_targets_from_dir(self, target_dir, roi_config_path=None, detector=None, mask_config_path=None):
+    def load_targets_from_dir(self, target_dir, roi_config_path=None, detector=None, mask_config_path=None, preprocessor=None):
         """
         target_image 폴더에서 이미지를 읽어 ORB 특징점을 추출합니다.
 
@@ -115,11 +115,16 @@ class ScreenMatcher:
             print(f"[matcher] 타겟 폴더를 찾을 수 없습니다: {target_dir}")
             return targets
 
-        try:
-            from engine.preprocessor import ImagePreprocessor
-            preprocessor = ImagePreprocessor()
-        except Exception:
-            preprocessor = None
+        # 외부에서 주입된 preprocessor 우선 사용 — 없으면 기본값으로 생성.
+        # ⚠️ 타겟과 라이브 프레임이 동일한 전처리 파라미터를 거쳐야 descriptor가 일치함.
+        #    tab_monitor.py 에서 self.preprocessor 를 넘겨줘야 파라미터 변경이 즉시 반영됨.
+        if preprocessor is None:
+            try:
+                from engine.preprocessor import ImagePreprocessor
+                preprocessor = ImagePreprocessor()
+                print("[matcher] 경고: preprocessor 미전달 → 기본값 사용 (타겟/프레임 파라미터 불일치 가능)")
+            except Exception:
+                preprocessor = None
 
         for fname in sorted(os.listdir(target_dir)):
             if not fname.lower().endswith((".png", ".jpg", ".jpeg")):

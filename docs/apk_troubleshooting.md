@@ -165,6 +165,59 @@ function CameraContent({ serverUrl, onOpenSettings }) {
 
 ---
 
+### [해결 완료] "다시 시도" 버튼이 카메라를 실제로 재초기화하지 않음
+
+**증상**: "카메라 초기화 중..." 8초 후 에러 화면 → "다시 시도" 눌러도 다시 8초 기다리다 동일 에러 반복
+
+**원인**: 3가지 버그가 동시에 존재
+
+| # | 버그 | 원인 |
+|---|---|---|
+| 1 | "다시 시도"가 실제로 아무것도 안 함 | `deviceKey`를 올려도 `useCameraDevice()`는 재실행되지 않음. `CameraContent` 내부 state를 바꿔도 훅은 재호출되지 않음 |
+| 2 | `isActive={true}` 하드코딩 | 앱이 백그라운드로 갔다 돌아올 때 Android OS가 카메라를 점유 중으로 판단 → 초기화 실패 |
+| 3 | `onError` 없음 | 카메라 런타임 오류가 소리 없이 삼켜짐 → 스피너만 돌고 원인 파악 불가 |
+
+**해결**:
+```tsx
+// ✅ 올바른 구조 — retryKey를 CameraScreen 레벨에 두고 key prop으로 전달
+export default function CameraScreen(...) {
+  const [retryKey, setRetryKey] = useState(0);
+  // ...
+  return (
+    <CameraContent
+      key={retryKey}           // ← key 변경 시 CameraContent 완전 언마운트/리마운트
+      onRetry={() => setRetryKey(k => k + 1)}
+      ...
+    />
+  );
+}
+
+function CameraContent({ onRetry, ... }) {
+  // AppState로 포그라운드/백그라운드 감지
+  const [isAppActive, setIsAppActive] = useState(AppState.currentState === 'active');
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', s => setIsAppActive(s === 'active'));
+    return () => sub.remove();
+  }, []);
+
+  // 카메라 컴포넌트
+  <Camera
+    isActive={isAppActive}    // ← 하드코딩 true 제거
+    onError={(e) => setCameraError(`${e.code}: ${e.message}`)}  // ← 오류 캐치
+    ...
+  />
+
+  // 에러 화면에서 onRetry() 호출 → CameraContent 완전 리마운트
+  <TouchableOpacity onPress={onRetry}>다시 시도</TouchableOpacity>
+}
+```
+
+**핵심 교훈**:
+- `useCameraDevice`를 재실행하려면 **컴포넌트 언마운트/리마운트**가 필요하다 (React `key` prop 활용)
+- 단순 state 변경으로는 훅을 재초기화할 수 없다
+
+---
+
 ### [해결 완료] 카메라 깜빡임 (구버전 아키텍처 문제)
 **증상**: 프레임이 교체될 때마다 화면이 깜빡임
 **원인 (구버전)**: 카메라를 `opacity:0`으로 숨기고, `takeSnapshot()` 후 서버가 반환한 어노테이션 JPEG를 `<Image>`로 표시. Image source 교체 시마다 리렌더 → 깜빡임

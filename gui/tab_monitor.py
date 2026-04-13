@@ -24,8 +24,8 @@ C_SUB    = "#7F8C8D"; C_BLUE   = "#3498DB"; C_GREEN  = "#27AE60"
 C_RED    = "#E74C3C"; C_ORANGE = "#E67E22"; C_BORDER = "#E0E4E8"
 C_YELLOW = "#F39C12"
 
-MATCH_THRESHOLD    = 60
-# NOTE: pending 저장은 MATCH_THRESHOLD 기준 ±margin(2~3점) 방식으로 동작합니다.
+FINAL_PASS_THRESHOLD = 60
+# NOTE: pending 저장은 ROI 모드 제외, 전체 이미지 매칭(final_pass_threshold) 기준 ±3점 이내 프레임만 수집합니다.
 # (tab_monitor.py:1194 참고) PENDING_THRESHOLD는 더 이상 사용되지 않습니다.
 
 # 설정 파일에서 임계값 덮어쓰기 (파일이 없으면 위 기본값 유지)
@@ -36,7 +36,8 @@ try:
     if os.path.isfile(_cfg_path):
         with open(_cfg_path, "r", encoding="utf-8") as _f:
             _saved = _json.load(_f)
-        MATCH_THRESHOLD = int(_saved.get("MATCH_THRESHOLD", MATCH_THRESHOLD))
+        # 하위 호환: 구 키(MATCH_THRESHOLD) → 신 키(final_pass_threshold)
+        FINAL_PASS_THRESHOLD = int(_saved.get("final_pass_threshold", _saved.get("MATCH_THRESHOLD", FINAL_PASS_THRESHOLD)))
 except Exception:
     pass
 
@@ -47,15 +48,21 @@ PARAMS_CONFIG_FILE = os.path.join(_ROOT, "data", "params_config.json")
 
 def _load_params_config() -> dict:
     defaults = {
-        "nfeatures": 700, "lowe_ratio": 0.75, "match_threshold": 25,
+        "nfeatures": 700, "lowe_ratio": 0.75, "orb_compare_threshold": 25,
         "roi_match_threshold": 7, "clahe_clip_limit": 2.0, "clahe_tile_grid": 8,
-        "MATCH_THRESHOLD": 60,
+        "final_pass_threshold": 60,
         "blur_ksize": 0, "gamma": 1.0, "sharpen_amount": 1.0,
     }
     if os.path.isfile(PARAMS_CONFIG_FILE):
         try:
             with open(PARAMS_CONFIG_FILE, "r", encoding="utf-8") as f:
-                return {**defaults, **json.load(f)}
+                saved = json.load(f)
+            # 하위 호환: 구 키 → 신 키 (기존 params_config.json이 있을 경우 자동 변환)
+            if "match_threshold" in saved and "orb_compare_threshold" not in saved:
+                saved["orb_compare_threshold"] = saved.pop("match_threshold")
+            if "MATCH_THRESHOLD" in saved and "final_pass_threshold" not in saved:
+                saved["final_pass_threshold"] = saved.pop("MATCH_THRESHOLD")
+            return {**defaults, **saved}
         except Exception:
             pass
     return defaults
@@ -200,7 +207,7 @@ class BoxPlotWidget(QWidget):
         for a,b in [(mn,q1),(q3,mx)]: p.drawLine(px(a),cy,px(b),cy)
         for v in [mn,mx]: p.drawLine(px(v),cy-7,px(v),cy+7)
         if self.is_time: bc = C_RED if med > 120 else C_GREEN
-        else: bc = C_GREEN if med >= MATCH_THRESHOLD else C_RED
+        else: bc = C_GREEN if med >= FINAL_PASS_THRESHOLD else C_RED
         p.setBrush(QBrush(QColor(bc).lighter(180))); p.setPen(QPen(QColor(bc),2))
         p.drawRect(px(q1),cy-bh//2,max(2,px(q3)-px(q1)),bh)
         p.setPen(QPen(QColor(bc),3)); p.drawLine(px(med),cy-bh//2,px(med),cy+bh//2)
@@ -950,8 +957,8 @@ class VideoThread(QThread):
         self._last_display_frame  = None  # ROI 오버레이가 그려진 최근 분석 프레임
         self.show_crop            = False # True: YOLO 크롭 뷰, False: 풀프레임 뷰
         self._reload_requested    = False # 파라미터 즉시 재적용 플래그
-        self._match_threshold     = MATCH_THRESHOLD
-        self._roi_match_threshold = 7
+        self._final_pass_threshold = FINAL_PASS_THRESHOLD
+        self._roi_match_threshold  = 7
 
     def pause_resume(self):
         self._paused = not self._paused
@@ -976,7 +983,7 @@ class VideoThread(QThread):
             self.matcher = ScreenMatcher(
                 orb_nfeatures=int(_cfg["nfeatures"]),
                 lowe_ratio=float(_cfg["lowe_ratio"]),
-                match_threshold=int(_cfg["match_threshold"]),
+                orb_compare_threshold=int(_cfg["orb_compare_threshold"]),
             )
             self.skipper = FrameSkipper(skip_frames=2)
         except Exception as e:
@@ -1003,7 +1010,8 @@ class VideoThread(QThread):
                 elif os.path.exists(det_model):
                     model_path = det_model
             self.detector = BezelDetector(model_path=model_path)
-            print(f"[VideoThread] YOLO 로드 완료: {os.path.basename(model_path)}")
+            self.detector.set_imgsz(int(_cfg.get("yolo_imgsz", 640)))
+            print(f"[VideoThread] YOLO 로드 완료: {os.path.basename(model_path)} imgsz={self.detector._imgsz}")
         except Exception as e:
             err_msg = f"[VideoThread] YOLO 초기화 실패 (ORB 단독 폴백 모드): {e}"
             print(err_msg)
@@ -1020,13 +1028,14 @@ class VideoThread(QThread):
                 mask_cfg = os.path.join(_ROOT, "data", "mask_config.json")
                 self.targets = self.matcher.load_targets_from_dir(
                     td, ROI_SAVE_FILE, detector=self.detector,
-                    mask_config_path=mask_cfg)
+                    mask_config_path=mask_cfg,
+                    preprocessor=self.preprocessor)
             except Exception as e:
                 print(f"[VideoThread] 타겟 로드 실패: {e}")
 
         from engine.matcher import RESIZE_W, RESIZE_H
-        self._roi_match_threshold = int(_cfg["roi_match_threshold"])
-        self._match_threshold     = int(_cfg.get("MATCH_THRESHOLD", MATCH_THRESHOLD))
+        self._roi_match_threshold  = int(_cfg["roi_match_threshold"])
+        self._final_pass_threshold = int(_cfg.get("final_pass_threshold", _cfg.get("MATCH_THRESHOLD", FINAL_PASS_THRESHOLD)))
 
         cap = cv2.VideoCapture(self.source)
         if not cap.isOpened(): return
@@ -1129,7 +1138,12 @@ class VideoThread(QThread):
                         l_detail = []
                         if n_rois == 0:
                             # ROI 미설정 → 전체 이미지 fallback
-                            s, p = self.matcher.compare_descriptors(full_des_cache, t_data.get('full'))
+                            # YOLO 성공(active_bbox) → 크롭 이미지 → orb_compare_threshold (정상 합격 기준)
+                            # YOLO 실패(None)        → 원본 전체   → final_pass_threshold  (최후 수단)
+                            thr = self.matcher.orb_compare_threshold if active_bbox is not None else self._final_pass_threshold
+                            s, p = self.matcher.compare_descriptors(
+                                full_des_cache, t_data.get('full'),
+                                threshold=thr)
                             return tid, 1, s, (1 if p else 0), p, l_detail
 
                         l_passed = 0; max_s = 0
@@ -1147,17 +1161,29 @@ class VideoThread(QThread):
 
                     if self.targets:
                         import concurrent.futures
-                        futures = [self._target_executor.submit(_compare_single_target, item) 
+                        futures = [self._target_executor.submit(_compare_single_target, item)
                                    for item in self.targets.items()]
+                        all_results = []
                         for future in concurrent.futures.as_completed(futures):
                             tid, n_tot, cur_max_s, passed, tok, l_detail = future.result()
                             frame_roi_detail.extend(l_detail)
-                            if tok or cur_max_s > best_score:
-                                best_score  = cur_max_s
-                                best_passed = passed
-                                best_total  = n_tot
-                                best_ok     = tok
-                                best_target_id = tid
+                            all_results.append((tid, n_tot, cur_max_s, passed, tok))
+
+                        # 상대 비교: 합격(tok=True) 중 최고점 우선, 없으면 전체 최고점
+                        passing = [(tid, n_tot, s, p, tok)
+                                   for tid, n_tot, s, p, tok in all_results if tok]
+                        if passing:
+                            tid, n_tot, cur_max_s, passed, tok = max(passing, key=lambda x: x[2])
+                        elif all_results:
+                            tid, n_tot, cur_max_s, passed, tok = max(all_results, key=lambda x: x[2])
+                        else:
+                            tid, n_tot, cur_max_s, passed, tok = '', 0, 0, 0, False
+
+                        best_score     = cur_max_s
+                        best_passed    = passed
+                        best_total     = n_tot
+                        best_ok        = tok
+                        best_target_id = tid
 
                     score      = best_score
                     roi_passed = best_passed
@@ -1211,11 +1237,10 @@ class VideoThread(QThread):
                         self.capture_signal.emit(mfname)
 
                     # ⑤ 애매한 점수대(Hard Mining) → pending 캡처
-                    # 의미 없는(너무 낮은) 점수는 버리고, 커트라인 근접 데이터만 수집
-                    margin = 2 if roi_total > 0 else 3
-                    target_thr = self._roi_match_threshold if roi_total > 0 else self._match_threshold
-
-                    if abs(score - target_thr) <= margin:
+                    # ROI 모드(다중 ROI)는 수집 제외 — 전체 이미지 매칭 기준으로만 수집
+                    # 기준: YOLO 성공 → orb_compare_threshold / YOLO 실패 → final_pass_threshold
+                    _pending_ref = self.matcher.orb_compare_threshold if active_bbox is not None else self._final_pass_threshold
+                    if roi_total == 0 and abs(score - _pending_ref) <= 2:
                         from datetime import datetime as _dt
                         _ts = _dt.now().strftime("%Y%m%d_%H%M%S_%f")[:18]
                         pfname = f"pending_{_ts}_s{score:02d}.jpg"
@@ -1330,14 +1355,18 @@ class VideoThread(QThread):
             self.matcher = ScreenMatcher(
                 orb_nfeatures=int(_cfg["nfeatures"]),
                 lowe_ratio=float(_cfg["lowe_ratio"]),
-                match_threshold=int(_cfg["match_threshold"]),
+                orb_compare_threshold=int(_cfg["orb_compare_threshold"]),
             )
-            self._roi_match_threshold = int(_cfg["roi_match_threshold"])
-            self._match_threshold     = int(_cfg.get("MATCH_THRESHOLD", MATCH_THRESHOLD))
-            # 타겟 특징점도 새 matcher로 재로드
+            self._roi_match_threshold  = int(_cfg["roi_match_threshold"])
+            self._final_pass_threshold = int(_cfg.get("final_pass_threshold", _cfg.get("MATCH_THRESHOLD", FINAL_PASS_THRESHOLD)))
+            # yolo_imgsz 변경 즉시 반영 (이전에는 매 프레임 파일 읽기로 반영했으나 제거됨)
+            if self.detector:
+                self.detector.set_imgsz(int(_cfg.get("yolo_imgsz", 640)))
+            # 타겟 특징점도 새 preprocessor 파라미터로 재로드 (프레임과 동일한 전처리)
             td = os.path.join(_ROOT, "data", "targets")
             self.targets = self.matcher.load_targets_from_dir(
-                td, ROI_SAVE_FILE, detector=self.detector)
+                td, ROI_SAVE_FILE, detector=self.detector,
+                preprocessor=self.preprocessor)
             print(f"[VideoThread] 파라미터 즉시 재적용 완료")
         except Exception as ex:
             print(f"[VideoThread] 파라미터 재적용 실패: {ex}")
@@ -1354,7 +1383,8 @@ class VideoThread(QThread):
         try:
             td = os.path.join(_ROOT, "data", "targets")
             self.targets = self.matcher.load_targets_from_dir(
-                td, ROI_SAVE_FILE, detector=self.detector)
+                td, ROI_SAVE_FILE, detector=self.detector,
+                preprocessor=self.preprocessor)
             print(f"[VideoThread] 타겟 재로드 완료: {list(self.targets.keys())}")
         except Exception as ex:
             print(f"[VideoThread] 타겟 재로드 실패: {ex}")
@@ -2476,7 +2506,1336 @@ class SiameseMonitorSubTab(QWidget):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  최종 MonitorTab (서브탭 A + 서브탭 B + 서브탭 C)
+#  서브탭 D: 모바일 기기 관제
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_PHONE_SERVER = "http://localhost:8765"
+
+
+class _ClientsPoller(QThread):
+    """500ms마다 /clients + 각 폰 썸네일 프레임을 폴링하는 백그라운드 스레드."""
+    clients_updated = pyqtSignal(list)        # list[dict]
+    thumb_updated   = pyqtSignal(str, bytes)  # (cid, jpeg_bytes)
+
+    def __init__(self, base_url: str = _PHONE_SERVER):
+        super().__init__()
+        self._base_url = base_url
+        self._running  = True
+
+    def run(self):
+        import urllib.request as _req
+        import json as _json
+        while self._running:
+            # /clients 폴링 — 실패하면 UI를 건드리지 않고 다음 사이클로 넘어감.
+            # 이전 코드는 실패 시 []를 emit해 모든 카드를 초기화했음 (끊기는 원인).
+            try:
+                with _req.urlopen(f"{self._base_url}/clients", timeout=1) as r:
+                    clients = _json.loads(r.read())
+            except Exception:
+                self.msleep(500)
+                continue
+
+            self.clients_updated.emit(clients)
+
+            # 썸네일 프레임 폴링 — 각 폰마다 독립적으로 실패 처리
+            for c in clients:
+                if not self._running:
+                    break
+                try:
+                    with _req.urlopen(
+                            f"{self._base_url}/frame/{c['cid']}", timeout=1) as r:
+                        data = r.read()
+                    if data:
+                        self.thumb_updated.emit(c["cid"], data)
+                except Exception:
+                    pass
+
+            self.msleep(500)
+
+    def stop(self):
+        self._running = False
+
+
+class _FramePoller(QThread):
+    """200ms마다 선택된 폰의 /frame/{cid}를 폴링하는 백그라운드 스레드."""
+    updated = pyqtSignal(bytes)
+
+    def __init__(self, base_url: str = _PHONE_SERVER):
+        super().__init__()
+        self._base_url = base_url
+        self._cid: str | None = None
+        self._running = True
+
+    def set_cid(self, cid: str | None):
+        self._cid = cid
+
+    def run(self):
+        import urllib.request as _req
+        while self._running:
+            cid = self._cid
+            if cid:
+                try:
+                    with _req.urlopen(
+                            f"{self._base_url}/frame/{cid}", timeout=1) as r:
+                        data = r.read()
+                    if data:
+                        self.updated.emit(data)
+                except Exception:
+                    pass
+            # 200ms → 333ms: 5fps → 3fps로 낮춰 서버 HTTP 부하 감소
+            # UI 건드릴 때 메인 스레드와 서버 event loop에 여유 확보
+            self.msleep(333)
+
+    def stop(self):
+        self._running = False
+
+
+class PhoneThumbnailCard(QFrame):
+    """연결된 폰 한 대를 표시하는 썸네일 카드 (4개 그리드)."""
+    selected = pyqtSignal(str)  # cid
+
+    def __init__(self, slot: int):
+        super().__init__()
+        self._slot = slot
+        self._cid: str | None = None
+        self.setFixedSize(170, 165)
+        self.setCursor(Qt.PointingHandCursor)
+        self._build_ui()
+        self._set_empty()
+
+    def _build_ui(self):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(7, 7, 7, 7)
+        v.setSpacing(4)
+
+        self.lbl_title = QLabel()
+        self.lbl_title.setFont(QFont("Malgun Gothic", 9, QFont.Bold))
+
+        self.lbl_img = QLabel()
+        self.lbl_img.setAlignment(Qt.AlignCenter)
+        self.lbl_img.setFixedSize(156, 98)
+
+        self.lbl_status = QLabel()
+        self.lbl_status.setFont(QFont("Malgun Gothic", 9, QFont.Bold))
+
+        self.lbl_fps = QLabel()
+        self.lbl_fps.setStyleSheet(f"color:{C_SUB}; font-size:9px;")
+
+        v.addWidget(self.lbl_title)
+        v.addWidget(self.lbl_img)
+        v.addWidget(self.lbl_status)
+        v.addWidget(self.lbl_fps)
+
+    def _set_empty(self):
+        self._cid = None
+        self.setStyleSheet(
+            f"background:{C_BG}; border:1px dashed {C_BORDER}; border-radius:8px;")
+        self.lbl_title.setText(f"슬롯 {self._slot + 1}")
+        self.lbl_title.setStyleSheet(f"color:{C_SUB};")
+        self.lbl_img.clear()
+        self.lbl_img.setText("빈 슬롯")
+        self.lbl_img.setStyleSheet(
+            f"background:#1a1a2e; border-radius:4px; color:{C_SUB}; font-size:10px;")
+        self.lbl_status.clear()
+        self.lbl_fps.clear()
+
+    def assign(self, info: dict):
+        """클라이언트 메타데이터로 카드 갱신."""
+        self._cid = info["cid"]
+        self.setStyleSheet(
+            f"background:{C_WHITE}; border:1px solid {C_BORDER}; border-radius:8px;")
+        self.lbl_title.setText(f"폰 #{self._slot + 1}")
+        self.lbl_title.setStyleSheet(f"color:{C_DARK};")
+
+        status = info.get("status", "unknown")
+        if status == "pass":
+            self.lbl_status.setText("✅ PASS")
+            self.lbl_status.setStyleSheet(f"color:{C_GREEN}; font-size:9px;")
+        elif status == "fail":
+            self.lbl_status.setText("❌ FAIL")
+            self.lbl_status.setStyleSheet(f"color:{C_RED}; font-size:9px;")
+        else:
+            self.lbl_status.setText("● 대기중")
+            self.lbl_status.setStyleSheet(f"color:{C_SUB}; font-size:9px;")
+
+        fps = info.get("fps", 0.0)
+        self.lbl_fps.setText(f"{fps:.1f} fps")
+
+    def set_frame(self, jpeg: bytes):
+        """썸네일 카메라 이미지 업데이트."""
+        buf = np.frombuffer(jpeg, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is None:
+            return
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
+        h, w = rgb.shape[:2]
+        qi = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+        px = QPixmap.fromImage(qi).scaled(
+            156, 98, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.lbl_img.setPixmap(px)
+        self.lbl_img.setStyleSheet("background:#1a1a2e; border-radius:4px;")
+
+    def set_selected(self, on: bool):
+        if self._cid is None:
+            return
+        border = f"2px solid {C_BLUE}" if on else f"1px solid {C_BORDER}"
+        self.setStyleSheet(f"background:{C_WHITE}; border:{border}; border-radius:8px;")
+
+    def release(self):
+        self._set_empty()
+
+    @property
+    def cid(self):
+        return self._cid
+
+    def mousePressEvent(self, e):
+        if self._cid:
+            self.selected.emit(self._cid)
+        super().mousePressEvent(e)
+
+
+class PhoneMonitorSubTab(QWidget):
+    """
+    📱 모바일 기기 관제 서브탭.
+    - 상단 4칸 그리드: 연결된 폰 썸네일 카드 (클릭 → 하단 대형 뷰 전환)
+    - 하단 대형 뷰: 선택된 폰의 실시간 카메라 화면 + PASS/FAIL 배지
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._selected_cid: str | None = None
+        self._cards: list[PhoneThumbnailCard] = []
+        self._cid_to_slot: dict[str, int] = {}
+        self._last_clients: list[dict] = []
+        self._build_ui()
+        self._start_pollers()
+
+    # ── UI 구성 ─────────────────────────────────────────────
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        # 헤더
+        self.lbl_count = QLabel("📱  연결된 기기 (0대)")
+        self.lbl_count.setFont(QFont("Malgun Gothic", 12, QFont.Bold))
+        self.lbl_count.setStyleSheet(f"color:{C_DARK};")
+        root.addWidget(self.lbl_count)
+
+        # 4칸 썸네일 그리드
+        grid = QHBoxLayout()
+        grid.setSpacing(12)
+        for i in range(4):
+            card = PhoneThumbnailCard(i)
+            card.selected.connect(self._on_card_selected)
+            self._cards.append(card)
+            grid.addWidget(card)
+        grid.addStretch(1)
+        root.addLayout(grid)
+
+        # 구분선
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color:{C_BORDER};")
+        root.addWidget(sep)
+
+        # 대형 뷰 헤더
+        self.lbl_detail = QLabel("선택된 기기 없음  —  썸네일을 클릭하면 대형 뷰로 전환됩니다")
+        self.lbl_detail.setStyleSheet(f"color:{C_SUB}; font-size:12px;")
+        root.addWidget(self.lbl_detail)
+
+        # 대형 카메라 뷰
+        self.large_view = VideoDisplayLabel()
+        root.addWidget(self.large_view, stretch=1)
+
+    # ── 폴러 시작 ────────────────────────────────────────────
+    def _start_pollers(self):
+        self._clients_poller = _ClientsPoller()
+        self._clients_poller.clients_updated.connect(self._on_clients_updated)
+        self._clients_poller.thumb_updated.connect(self._on_thumb_updated)
+        self._clients_poller.start()
+
+        self._frame_poller = _FramePoller()
+        self._frame_poller.updated.connect(self._on_large_frame_updated)
+        self._frame_poller.start()
+
+    # ── 슬롯 ────────────────────────────────────────────────
+    def _on_card_selected(self, cid: str):
+        # 이전 선택 해제
+        if self._selected_cid and self._selected_cid in self._cid_to_slot:
+            self._cards[self._cid_to_slot[self._selected_cid]].set_selected(False)
+
+        self._selected_cid = cid
+        self._frame_poller.set_cid(cid)
+
+        slot = self._cid_to_slot.get(cid)
+        if slot is not None:
+            self._cards[slot].set_selected(True)
+
+        self._refresh_detail_label()
+
+    def _on_clients_updated(self, clients: list):
+        self._last_clients = clients
+        self.lbl_count.setText(f"📱  연결된 기기 ({len(clients)}대)")
+
+        new_cids = {c["cid"] for c in clients}
+
+        # 끊긴 클라이언트 슬롯 해제
+        for cid in list(self._cid_to_slot.keys()):
+            if cid not in new_cids:
+                slot = self._cid_to_slot.pop(cid)
+                self._cards[slot].release()
+                if self._selected_cid == cid:
+                    self._selected_cid = None
+                    self._frame_poller.set_cid(None)
+                    self.lbl_detail.setText(
+                        "선택된 기기 없음  —  썸네일을 클릭하면 대형 뷰로 전환됩니다")
+                    self.large_view.set_frame(QPixmap())
+
+        # 신규 클라이언트 슬롯 할당 + 기존 메타데이터 갱신
+        used_slots = set(self._cid_to_slot.values())
+        for client in clients:
+            cid = client["cid"]
+            if cid not in self._cid_to_slot:
+                for i in range(4):
+                    if i not in used_slots:
+                        self._cid_to_slot[cid] = i
+                        used_slots.add(i)
+                        break
+            slot = self._cid_to_slot.get(cid)
+            if slot is not None:
+                self._cards[slot].assign(client)
+
+        self._refresh_detail_label()
+
+    def _on_thumb_updated(self, cid: str, jpeg: bytes):
+        slot = self._cid_to_slot.get(cid)
+        if slot is not None:
+            self._cards[slot].set_frame(jpeg)
+
+    def _on_large_frame_updated(self, jpeg: bytes):
+        buf = np.frombuffer(jpeg, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is None:
+            return
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
+        h, w = rgb.shape[:2]
+        qi = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+        self.large_view.set_frame(QPixmap.fromImage(qi))
+
+    def _refresh_detail_label(self):
+        if not self._selected_cid:
+            return
+        for c in self._last_clients:
+            if c["cid"] == self._selected_cid:
+                slot  = self._cid_to_slot.get(self._selected_cid, 0)
+                status = c.get("status", "?")
+                target = c.get("target_id")
+                fps    = c.get("fps", 0.0)
+                icon   = "✅ PASS" if status == "pass" else "❌ FAIL"
+                t_txt  = f" · 타겟 {target}" if target else ""
+                self.lbl_detail.setText(
+                    f"선택된 기기: 폰 #{slot + 1}  |  {icon}{t_txt}  |  {fps:.1f} fps")
+                break
+
+    def closeEvent(self, e):
+        self._clients_poller.stop()
+        self._frame_poller.stop()
+        self._clients_poller.wait(1000)
+        self._frame_poller.wait(1000)
+        super().closeEvent(e)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  [신규] 서브탭 E: ORB vs AKAZE A/B 비교 관제
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _akaze_load_targets(target_dir, roi_config_path, mask_config_path,
+                        preprocessor, detector, lowe_ratio):
+    """
+    AKAZE용 타겟 특징점을 로드합니다.
+    ORB의 load_targets_from_dir과 동일한 전처리·YOLO 크롭·마스크·ROI 로직을 사용하되,
+    특징점 추출기만 AKAZE로 대체합니다 (변인 통제).
+    반환 구조: { screen_id: {'rois': [(des,x1,y1,x2,y2),...], 'full': des, 'n_rois': N} }
+    """
+    from engine.matcher import RESIZE_W, RESIZE_H
+
+    # AKAZE 생성 — MLDB 이진 디스크립터 사용 (NORM_HAMMING 매칭 가능)
+    akaze = cv2.AKAZE_create(
+        descriptor_type=cv2.AKAZE_DESCRIPTOR_MLDB,  # 이진 디스크립터 → 해밍 거리 사용
+        threshold=0.0008,                           # 낮을수록 더 많은 특징점 (ORB 700개 근사)
+        nOctaves=4,
+        nOctaveLayers=4,
+    )
+
+    # ROI 설정 로드
+    roi_config = {}
+    if roi_config_path and os.path.isfile(roi_config_path):
+        try:
+            with open(roi_config_path, 'r', encoding='utf-8') as f:
+                roi_config = json.load(f)
+        except Exception as ex:
+            print(f"[AKAZE] ROI 설정 로드 실패: {ex}")
+
+    # 마스크 설정 로드
+    mask_config = {}
+    if mask_config_path and os.path.isfile(mask_config_path):
+        try:
+            with open(mask_config_path, 'r', encoding='utf-8') as f:
+                mask_config = json.load(f)
+        except Exception as ex:
+            print(f"[AKAZE] 마스크 설정 로드 실패: {ex}")
+
+    PAD = 0.05
+    targets = {}
+    if not os.path.isdir(target_dir):
+        return targets
+
+    for fname in sorted(os.listdir(target_dir)):
+        if not fname.lower().endswith((".png", ".jpg", ".jpeg")):
+            continue
+        img_path = os.path.join(target_dir, fname)
+        try:
+            buf = np.fromfile(img_path, dtype=np.uint8)
+            img_color = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        except Exception as ex:
+            print(f"[AKAZE] 이미지 로드 실패: {fname} ({ex})")
+            continue
+        if img_color is None:
+            continue
+
+        # YOLO 크롭 (ORB와 동일 처리)
+        if detector is not None:
+            try:
+                cropped, _ = detector.detect_and_crop(img_color)
+                if cropped is not None and cropped.size > 0:
+                    img_color = cv2.resize(cropped, (RESIZE_W, RESIZE_H))
+                else:
+                    img_color = cv2.resize(img_color, (RESIZE_W, RESIZE_H))
+            except Exception:
+                img_color = cv2.resize(img_color, (RESIZE_W, RESIZE_H))
+        else:
+            img_color = cv2.resize(img_color, (RESIZE_W, RESIZE_H))
+
+        # 전처리 (ORB와 동일 파이프라인)
+        if preprocessor:
+            img_gray = preprocessor.preprocess_for_orb(img_color)
+        else:
+            img_gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
+
+        # 마스크 적용
+        target_masks = mask_config.get(fname, [])
+        if target_masks and preprocessor is not None:
+            img_gray = preprocessor.apply_masks(img_gray, target_masks)
+
+        # 전체 이미지 AKAZE 특징점 추출 (fallback용)
+        _, des_full = akaze.detectAndCompute(img_gray, None)
+
+        screen_id = os.path.splitext(fname)[0]
+        roi_defs  = roi_config.get(fname, [])
+        roi_list  = []
+
+        # ROI별 AKAZE 특징점 추출
+        for roi in roi_defs:
+            rx, ry, rw, rh = roi['x'], roi['y'], roi['w'], roi['h']
+            rx_p = max(0.0, rx - PAD * rw)
+            ry_p = max(0.0, ry - PAD * rh)
+            rw_p = min(1.0 - rx_p, rw * (1 + 2 * PAD))
+            rh_p = min(1.0 - ry_p, rh * (1 + 2 * PAD))
+            x1 = int(rx_p * RESIZE_W)
+            y1 = int(ry_p * RESIZE_H)
+            x2 = min(int((rx_p + rw_p) * RESIZE_W), RESIZE_W)
+            y2 = min(int((ry_p + rh_p) * RESIZE_H), RESIZE_H)
+            if x2 - x1 < 10 or y2 - y1 < 10:
+                continue
+            roi_crop = img_gray[y1:y2, x1:x2]
+            _, des_roi = akaze.detectAndCompute(roi_crop, None)
+            if des_roi is not None and len(des_roi) > 0:
+                roi_list.append((des_roi, x1, y1, x2, y2))
+
+        targets[screen_id] = {
+            'rois':   roi_list,
+            'full':   des_full,
+            'n_rois': len(roi_list),
+        }
+        print(f"[AKAZE] {fname}: ROI {len(roi_list)}개, 전체특징점 {len(des_full) if des_full is not None else 0}개")
+
+    return targets
+
+
+def _akaze_compare(matcher_bfhm, query_des, target_des, lowe_ratio, threshold):
+    """
+    AKAZE 디스크립터 비교 (Lowe's Ratio Test).
+    AKAZE MLDB → 이진 디스크립터 → NORM_HAMMING.
+    ORB의 compare_descriptors와 동일한 로직, 거리 기준만 다름.
+    """
+    if query_des is None or len(query_des) == 0 or target_des is None:
+        return 0, False
+    try:
+        matches = matcher_bfhm.knnMatch(query_des, target_des, k=2)
+    except Exception:
+        return 0, False
+    try:
+        good = [m for m, n in matches if m.distance < lowe_ratio * n.distance]
+    except ValueError:
+        good = [pair[0] for pair in matches
+                if len(pair) == 2 and pair[0].distance < lowe_ratio * pair[1].distance]
+    score = len(good)
+    return score, score >= threshold
+
+
+class AkazeCompareThread(QThread):
+    """
+    동일 프레임에 ORB와 AKAZE를 모두 실행해 비교합니다.
+
+    ▶ 변인 통제 (동일하게 유지):
+        - YOLO 크롭  : 한 번만 실행, 두 알고리즘에 공유
+        - 전처리     : blur → gamma → CLAHE → sharpen (동일 파라미터)
+        - 마스킹·ROI : 동일
+        - 최대 특징점: ORB 700개 | AKAZE threshold=0.0008 (≈700개 근사)
+
+    ▶ 독립변인 (알고리즘만 다름):
+        - ORB  : cv2.ORB_create(700) + NORM_HAMMING + Lowe's ratio
+        - AKAZE: cv2.AKAZE_create(MLDB) + NORM_HAMMING + Lowe's ratio
+    """
+    # fps, yolo_ms, pre_ms, ext_ms, cmp_ms, score, is_ok
+    orb_stats   = pyqtSignal(float, float, float, float, float, int, bool)
+    akaze_stats = pyqtSignal(float, float, float, float, float, int, bool)
+    # ORB 오버레이 프레임 / AKAZE 오버레이 프레임
+    orb_frame   = pyqtSignal(QImage)
+    akaze_frame = pyqtSignal(QImage)
+    progress_signal = pyqtSignal(int, int)
+
+    def __init__(self, source, akaze_lowe_ratio=0.75, akaze_threshold=10):
+        super().__init__()
+        self.source           = source
+        self.running          = True
+        self._paused          = False
+        self._seek_frame      = -1
+        # AKAZE 매칭 임계값 (슬라이더로 실시간 변경 가능)
+        self.akaze_lowe_ratio = akaze_lowe_ratio
+        self.akaze_threshold  = akaze_threshold
+        self._fps_ts          = deque(maxlen=7)
+        
+        # UI 연동용 옵션 플래그
+        self.show_crop        = False
+        self.skip_enabled     = True
+        self.use_clahe        = True
+
+
+    # ── 외부 제어 ──────────────────────────────────────────
+    def pause_resume(self):
+        self._paused = not self._paused
+
+    def set_frame(self, idx):
+        self._seek_frame = idx
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+    def set_akaze_threshold(self, val: int):
+        """슬라이더 → AKAZE 매칭 합격 컷오프 실시간 변경"""
+        self.akaze_threshold = val
+
+    def set_akaze_lowe(self, val: float):
+        """Lowe's ratio 실시간 변경"""
+        self.akaze_lowe_ratio = val
+
+    def set_show_crop(self, val: bool):
+        self.show_crop = val
+
+    def set_skip_enabled(self, val: bool):
+        self.skip_enabled = val
+
+    def set_clahe(self, val: bool):
+        self.use_clahe = val
+
+
+    # ── 메인 루프 ──────────────────────────────────────────
+    def run(self):
+        # ① 공통 전처리기 초기화
+        _cfg = _load_params_config()
+        preprocessor = None
+        try:
+            from engine.preprocessor import ImagePreprocessor
+            tile = int(_cfg["clahe_tile_grid"])
+            preprocessor = ImagePreprocessor(
+                clahe_clip_limit=float(_cfg["clahe_clip_limit"]),
+                clahe_tile_grid=(tile, tile),
+                blur_ksize=int(_cfg.get("blur_ksize", 0)),
+                gamma=float(_cfg.get("gamma", 1.0)),
+                sharpen_amount=float(_cfg.get("sharpen_amount", 1.0)),
+            )
+        except Exception as e:
+            print(f"[AkazeThread] 전처리기 초기화 실패: {e}")
+
+        # ② ORB 매처 (기존과 동일 파라미터)
+        orb_nfeatures  = int(_cfg.get("nfeatures", 700))
+        orb_lowe       = float(_cfg.get("lowe_ratio", 0.75))
+        orb_threshold  = int(_cfg.get("orb_compare_threshold", _cfg.get("match_threshold", 25)))
+        orb_roi_thr    = int(_cfg.get("roi_match_threshold", 7))
+        orb_match_thr  = int(_cfg.get("final_pass_threshold", _cfg.get("MATCH_THRESHOLD", FINAL_PASS_THRESHOLD)))
+
+        orb    = cv2.ORB_create(nfeatures=orb_nfeatures)
+        bf_orb = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+        # ③ AKAZE 생성 + 매처
+        akaze    = cv2.AKAZE_create(
+            descriptor_type=cv2.AKAZE_DESCRIPTOR_MLDB,
+            threshold=0.0008,
+            nOctaves=4,
+            nOctaveLayers=4,
+        )
+        bf_akaze = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+        # ④ YOLO 탐지기 초기화 (Seg 대신 커스텀 BBox 모델 강제 적용)
+        detector = None
+        try:
+            from engine.detector import BezelDetector
+            # 사용자가 학습한 BBox 최적화 모델 사용
+            model_path = os.path.join(_ROOT, "bbox_best.pt")
+            
+            if os.path.exists(model_path):
+                detector = BezelDetector(model_path=model_path)
+                print(f"[AkazeThread] YOLO 커스텀 BBox 모델 로드: {os.path.basename(model_path)}")
+        except Exception as e:
+            print(f"[AkazeThread] YOLO 초기화 실패 (폴백): {e}")
+
+        # ⑤ 타겟 로드 — ORB용 / AKAZE용 각각 로드
+        td           = os.path.join(_ROOT, "data", "targets")
+        mask_cfg     = os.path.join(_ROOT, "data", "mask_config.json")
+        roi_cfg      = ROI_SAVE_FILE
+
+        orb_targets  = {}
+        akaze_targets = {}
+        try:
+            from engine.matcher import ScreenMatcher
+            sm = ScreenMatcher(orb_nfeatures, orb_lowe, orb_threshold)
+            orb_targets = sm.load_targets_from_dir(
+                td, roi_cfg, detector=detector,
+                mask_config_path=mask_cfg, preprocessor=preprocessor)
+            union_masks = getattr(sm, 'union_masks', [])
+        except Exception as e:
+            print(f"[AkazeThread] ORB 타겟 로드 실패: {e}")
+            union_masks = []
+
+        try:
+            akaze_targets = _akaze_load_targets(
+                td, roi_cfg, mask_cfg, preprocessor, detector, self.akaze_lowe_ratio)
+        except Exception as e:
+            print(f"[AkazeThread] AKAZE 타겟 로드 실패: {e}")
+
+        from engine.matcher import RESIZE_W, RESIZE_H
+        try:
+            from engine.frame_skipper import FrameSkipper
+            self.skipper = FrameSkipper(skip_frames=2)
+        except Exception as e:
+            self.skipper = None
+            print(f"[AkazeThread] FrameSkipper 초기화 실패: {e}")
+
+        # 캐싱(스킵 시 재사용) 변수
+        last_yolo_ms = last_pre_ms = 0.0
+        last_orb_ext_ms = last_orb_cmp_ms = 0.0
+        last_akz_ext_ms = last_akz_cmp_ms = 0.0
+        last_orb_score = last_akz_score = 0
+        last_orb_ok = last_akz_ok = False
+        last_active_bbox = None
+        last_orb_vis = None
+        last_akz_vis = None
+        last_verdict_akz = "FAIL"
+
+        # ⑥ 영상 열기
+        cap = cv2.VideoCapture(self.source)
+        if not cap.isOpened():
+            return
+        tot_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if tot_frames <= 0:
+            tot_frames = 1
+        idx = 0
+
+        while self.running:
+            if self._seek_frame >= 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, self._seek_frame)
+                self._seek_frame = -1
+
+            if self._paused:
+                self.msleep(50)
+                continue
+
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+
+            cur_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            self.progress_signal.emit(cur_frame, tot_frames)
+
+            should_proc = True
+            if self.skip_enabled and self.skipper:
+                should_proc = self.skipper.should_process()
+
+            if should_proc:
+                # ━ 공통 ① YOLO 크롭 (한 번만, 두 알고리즘에 공유) ━━━━━━━
+                t0 = time.perf_counter()
+                analysis_frame = cv2.resize(frame, (RESIZE_W, RESIZE_H))
+                active_bbox    = None
+                if detector:
+                    try:
+                        cropped, bbox = detector.detect_and_crop(frame)
+                        if cropped is not None and cropped.size > 0:
+                            analysis_frame = cv2.resize(cropped, (RESIZE_W, RESIZE_H))
+                            active_bbox    = bbox
+                    except Exception:
+                        pass
+                yolo_ms = (time.perf_counter() - t0) * 1000
+
+                # ━ 공통 ② 전처리 (CLAHE 등, 두 알고리즘에 공유) ━━━━━━━━
+                t1 = time.perf_counter()
+                if self.use_clahe and preprocessor:
+                    orb_ready = preprocessor.preprocess_for_orb(analysis_frame)
+                else:
+                    orb_ready = cv2.cvtColor(analysis_frame, cv2.COLOR_BGR2GRAY)
+                # 마스크 합집합 적용
+                if union_masks and preprocessor:
+                    orb_ready = preprocessor.apply_masks(orb_ready, union_masks)
+                # AKAZE도 동일 전처리 이미지 사용
+                akaze_ready = orb_ready
+                pre_ms = (time.perf_counter() - t1) * 1000
+    
+                # ━ ORB 처리 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                orb_score  = 0
+                orb_ok     = False
+                orb_roi_d  = []
+                t2 = time.perf_counter()
+                # ROI별 ORB 특징점 미리 추출 (좌표 중복 회피)
+                orb_live_roi = {}
+                orb_full_des = None
+                for _, t_data in orb_targets.items():
+                    if t_data.get('n_rois', 0) == 0:
+                        if orb_full_des is None:
+                            _, orb_full_des = orb.detectAndCompute(orb_ready, None)
+                    else:
+                        for (_, rx1, ry1, rx2, ry2) in t_data['rois']:
+                            key = (rx1, ry1, rx2, ry2)
+                            if key not in orb_live_roi:
+                                roi_c = orb_ready[ry1:ry2, rx1:rx2]
+                                if roi_c.size > 0:
+                                    _, q_des = orb.detectAndCompute(roi_c, None)
+                                    orb_live_roi[key] = q_des
+                                else:
+                                    orb_live_roi[key] = None
+                orb_ext_ms = (time.perf_counter() - t2) * 1000
+    
+                # ORB 타겟별 비교
+                t3 = time.perf_counter()
+                orb_all = []
+                for tid, t_data in orb_targets.items():
+                    n_rois = t_data.get('n_rois', 0)
+                    if n_rois == 0:
+                        # Lowe ratio 직접 적용 (sm 없이)
+                        q_des = orb_full_des
+                        t_des = t_data.get('full')
+                        if q_des is None or t_des is None:
+                            orb_all.append((tid, 1, 0, 0, False, []))
+                            continue
+                        try:
+                            ms = bf_orb.knnMatch(q_des, t_des, k=2)
+                            try:
+                                good = [m for m, n in ms if m.distance < orb_lowe * n.distance]
+                            except ValueError:
+                                good = [p[0] for p in ms if len(p) == 2 and p[0].distance < orb_lowe * p[1].distance]
+                            s = len(good)
+                            p = s >= orb_threshold
+                        except Exception:
+                            s, p = 0, False
+                        orb_all.append((tid, 1, s, 1 if p else 0, p, []))
+                    else:
+                        l_passed = 0; max_s = 0; l_det = []
+                        for roi_idx, (t_des, rx1, ry1, rx2, ry2) in enumerate(t_data['rois']):
+                            q_des = orb_live_roi.get((rx1, ry1, rx2, ry2))
+                            if q_des is None or t_des is None:
+                                continue
+                            try:
+                                ms = bf_orb.knnMatch(q_des, t_des, k=2)
+                                try:
+                                    good = [m for m, n in ms if m.distance < orb_lowe * n.distance]
+                                except ValueError:
+                                    good = [p[0] for p in ms if len(p) == 2 and p[0].distance < orb_lowe * p[1].distance]
+                                s = len(good)
+                                ok = s >= orb_roi_thr
+                            except Exception:
+                                s, ok = 0, False
+                            if s > max_s: max_s = s
+                            if ok: l_passed += 1
+                            l_det.append((tid, roi_idx, rx1, ry1, rx2, ry2, s, ok))
+                        req  = n_rois if n_rois <= 2 else n_rois - 1
+                        tok  = l_passed >= req
+                        orb_all.append((tid, n_rois, max_s, l_passed, tok, l_det))
+    
+                if orb_all:
+                    passing = [(t, n, s, p, ok, d) for t, n, s, p, ok, d in orb_all if ok]
+                    if passing:
+                        best = max(passing, key=lambda x: x[2])
+                    else:
+                        best = max(orb_all, key=lambda x: x[2])
+                    orb_score = best[2]
+                    orb_ok    = best[4]
+                    orb_roi_d = best[5]
+                orb_cmp_ms = (time.perf_counter() - t3) * 1000
+    
+                # ━ AKAZE 처리 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                akz_score = 0
+                akz_ok    = False
+                akz_roi_d = []
+                akz_cur_thr = self.akaze_threshold  # 슬라이더 값 스냅샷
+                akz_lowe    = self.akaze_lowe_ratio
+    
+                t4 = time.perf_counter()
+                akz_live_roi = {}
+                akz_full_des = None
+                for _, t_data in akaze_targets.items():
+                    if t_data.get('n_rois', 0) == 0:
+                        if akz_full_des is None:
+                            _, akz_full_des = akaze.detectAndCompute(akaze_ready, None)
+                    else:
+                        for (_, rx1, ry1, rx2, ry2) in t_data['rois']:
+                            key = (rx1, ry1, rx2, ry2)
+                            if key not in akz_live_roi:
+                                roi_c = akaze_ready[ry1:ry2, rx1:rx2]
+                                if roi_c.size > 0:
+                                    _, q_des = akaze.detectAndCompute(roi_c, None)
+                                    akz_live_roi[key] = q_des
+                                else:
+                                    akz_live_roi[key] = None
+                akz_ext_ms = (time.perf_counter() - t4) * 1000
+    
+                t5 = time.perf_counter()
+                akz_all = []
+                for tid, t_data in akaze_targets.items():
+                    n_rois = t_data.get('n_rois', 0)
+                    if n_rois == 0:
+                        s, ok = _akaze_compare(
+                            bf_akaze, akz_full_des, t_data.get('full'), akz_lowe, akz_cur_thr)
+                        akz_all.append((tid, 1, s, 1 if ok else 0, ok, []))
+                    else:
+                        l_passed = 0; max_s = 0; l_det = []
+                        roi_thr = max(3, akz_cur_thr // 3)  # ROI 크롭용 임계값 (비율 유사)
+                        for roi_idx, (t_des, rx1, ry1, rx2, ry2) in enumerate(t_data['rois']):
+                            q_des = akz_live_roi.get((rx1, ry1, rx2, ry2))
+                            s, ok = _akaze_compare(bf_akaze, q_des, t_des, akz_lowe, roi_thr)
+                            if s > max_s: max_s = s
+                            if ok: l_passed += 1
+                            l_det.append((tid, roi_idx, rx1, ry1, rx2, ry2, s, ok))
+                        req = n_rois if n_rois <= 2 else n_rois - 1
+                        tok = l_passed >= req
+                        akz_all.append((tid, n_rois, max_s, l_passed, tok, l_det))
+    
+                if akz_all:
+                    passing_a = [(t, n, s, p, ok, d) for t, n, s, p, ok, d in akz_all if ok]
+                    if passing_a:
+                        best_a = max(passing_a, key=lambda x: x[2])
+                    else:
+                        best_a = max(akz_all, key=lambda x: x[2])
+                    akz_score = best_a[2]
+                    akz_ok    = best_a[4]
+                    akz_roi_d = best_a[5]
+                akz_cmp_ms = (time.perf_counter() - t5) * 1000
+    
+                if should_proc:
+                    # ━ 오버레이 프레임 생성 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    orb_vis  = analysis_frame.copy()
+                    akz_vis  = analysis_frame.copy()
+    
+                    # ORB 오버레이 (합격 ROI: 초록, 불합격 ROI: 파랑)
+                    for (_, ri, rx1, ry1, rx2, ry2, s, p) in orb_roi_d:
+                        c = (0, 200, 0) if p else (0, 60, 220)
+                        cv2.rectangle(orb_vis, (rx1, ry1), (rx2, ry2), c, 2)
+                        cv2.putText(orb_vis, f"R{ri} {s}", (rx1+3, ry1+14),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, c, 1, cv2.LINE_AA)
+                    orb_col = (0, 200, 0) if orb_ok else (0, 60, 220)
+                    verdict_orb = "PASS" if orb_ok else "FAIL"
+                    cv2.rectangle(orb_vis, (0, 0), (240, 26), (0, 0, 0), -1)
+                    cv2.putText(orb_vis, f"ORB | {verdict_orb} | {orb_score}pt", (4, 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, orb_col, 1, cv2.LINE_AA)
+    
+                    # AKAZE 오버레이
+                    for (_, ri, rx1, ry1, rx2, ry2, s, p) in akz_roi_d:
+                        c = (0, 200, 120) if p else (0, 100, 255)
+                        cv2.rectangle(akz_vis, (rx1, ry1), (rx2, ry2), c, 2)
+                        cv2.putText(akz_vis, f"R{ri} {s}", (rx1+3, ry1+14),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, c, 1, cv2.LINE_AA)
+                    akz_col = (0, 200, 120) if akz_ok else (0, 100, 255)
+                    verdict_akz = "PASS" if akz_ok else "FAIL"
+                    cv2.rectangle(akz_vis, (0, 0), (290, 26), (0, 0, 0), -1)
+                    cv2.putText(akz_vis, f"AKAZE | {verdict_akz} | {akz_score}pt | thr={akz_cur_thr}",
+                                (4, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.48, akz_col, 1, cv2.LINE_AA)
+    
+                    # 상태 캐싱 갱신
+                    last_yolo_ms = yolo_ms
+                    last_pre_ms = pre_ms
+                    last_orb_ext_ms = orb_ext_ms
+                    last_orb_cmp_ms = orb_cmp_ms
+                    last_akz_ext_ms = akz_ext_ms
+                    last_akz_cmp_ms = akz_cmp_ms
+                    last_orb_score = orb_score
+                    last_orb_ok = orb_ok
+                    last_akz_score = akz_score
+                    last_akz_ok = akz_ok
+                    last_active_bbox = active_bbox
+                    last_verdict_akz = verdict_akz
+                    last_akz_col = akz_col
+                    last_orb_vis = orb_vis.copy()
+                    last_akz_vis = akz_vis.copy()
+            else:
+                # 스킵: 캐싱된 값 복원
+                yolo_ms = last_yolo_ms
+                pre_ms = last_pre_ms
+                orb_ext_ms = last_orb_ext_ms
+                orb_cmp_ms = last_orb_cmp_ms
+                akz_ext_ms = last_akz_ext_ms
+                akz_cmp_ms = last_akz_cmp_ms
+                orb_score = last_orb_score
+                orb_ok = last_orb_ok
+                akz_score = last_akz_score
+                akz_ok = last_akz_ok
+                active_bbox = last_active_bbox
+                verdict_akz = last_verdict_akz
+                akz_col = locals().get('last_akz_col', (0, 200, 120))
+                orb_vis = last_orb_vis if last_orb_vis is not None else frame.copy()
+                akz_vis = last_akz_vis if last_akz_vis is not None else frame.copy()
+
+            # emit 프레임
+            def _to_qimg(bgr):
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                h2, w2 = rgb.shape[:2]
+                return QImage(rgb.data, w2, h2, 3 * w2, QImage.Format_RGB888).copy()
+
+            if self.show_crop:
+                akz_disp = akz_vis
+            else:
+                akz_disp = frame.copy()
+                if active_bbox:
+                    x1, y1, x2, y2 = active_bbox
+                    cv2.rectangle(akz_disp, (x1, y1), (x2, y2), (0, 200, 255), 3)
+                    cv2.putText(akz_disp, f"AKAZE | {verdict_akz} | {akz_score}pt",
+                                (x1, max(0, y1 - 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, akz_col, 2, cv2.LINE_AA)
+
+            self.orb_frame.emit(_to_qimg(orb_vis))
+            self.akaze_frame.emit(_to_qimg(akz_disp))
+
+            # FPS 계산
+            curr_t = time.perf_counter()
+            self._fps_ts.append(curr_t)
+            fps_real = ((len(self._fps_ts) - 1) /
+                        max(self._fps_ts[-1] - self._fps_ts[0], 1e-6)
+                        ) if len(self._fps_ts) >= 2 else 0.0
+
+            # stats emit
+            self.orb_stats.emit(
+                fps_real, yolo_ms, pre_ms, orb_ext_ms, orb_cmp_ms, orb_score, orb_ok)
+            self.akaze_stats.emit(
+                fps_real, yolo_ms, pre_ms, akz_ext_ms, akz_cmp_ms, akz_score, akz_ok)
+            idx += 1
+
+        cap.release()
+
+
+class _ABStatsCard(QWidget):
+    """ORB 또는 AKAZE 한 쪽 결과를 표시하는 소형 통계 카드"""
+
+    def __init__(self, title: str, accent: str):
+        super().__init__()
+        self._accent = accent
+        self.setStyleSheet(
+            f"background:{C_WHITE}; border:1px solid {C_BORDER}; border-radius:8px;")
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(6)
+
+        # 헤더
+        lbl_title = QLabel(title)
+        lbl_title.setStyleSheet(
+            f"font-size:13px; font-weight:bold; color:{accent};")
+        v.addWidget(lbl_title)
+
+        # KPI 행
+        row = QHBoxLayout()
+        self._fps    = self._kpi("FPS",   "--")
+        self._score  = self._kpi("점수",  "--")
+        self._verdict= self._kpi("판정", "대기")
+        self._ext    = self._kpi("특징추출", "-- ms")
+        self._cmp    = self._kpi("비교",  "-- ms")
+        for kpi in [self._fps, self._score, self._verdict,
+                    self._ext, self._cmp]:
+            row.addWidget(kpi[0])  # kpi = (container_widget, value_label) → 위젯만 추가
+        v.addLayout(row)
+
+        # 박스플롯
+        self.boxplot = DualBoxPlotWidget(
+            title=f"{title}  매칭 점수 분포", max_val=60)
+        v.addWidget(self.boxplot)
+
+    # ── 헬퍼 ──────────────────────────────────────────────
+    def _kpi(self, label, val):
+        c = QWidget()
+        c.setStyleSheet(f"background:{C_BG}; border-radius:6px;")
+        cv2_ = QVBoxLayout(c)
+        cv2_.setContentsMargins(4, 4, 4, 4)
+        cv2_.setSpacing(2)
+        tl = QLabel(label)
+        tl.setAlignment(Qt.AlignCenter)
+        tl.setStyleSheet(f"font-size:9px; color:{C_SUB}; font-weight:bold;")
+        vl = QLabel(val)
+        vl.setAlignment(Qt.AlignCenter)
+        vl.setStyleSheet(f"font-size:14px; font-weight:bold; color:{C_DARK};")
+        cv2_.addWidget(tl)
+        cv2_.addWidget(vl)
+        return c, vl
+
+    def update_stats(self, fps, pre_ms, ext_ms, cmp_ms, score, is_ok):
+        col = self._accent if is_ok else C_RED
+        self._fps[1].setText(f"{fps:.0f}")
+        self._score[1].setText(str(score))
+        self._score[1].setStyleSheet(f"font-size:14px; font-weight:bold; color:{col};")
+        verdict = "✅ PASS" if is_ok else "❌ FAIL"
+        self._verdict[1].setText(verdict)
+        self._verdict[1].setStyleSheet(f"font-size:11px; font-weight:bold; color:{col};")
+        self._ext[1].setText(f"{ext_ms:.1f}ms")
+        self._cmp[1].setText(f"{cmp_ms:.1f}ms")
+        self.boxplot.add_score(float(score), is_ok)
+
+
+class AkazeBenchmarkSubTab(QWidget):
+    """
+    서브탭 E: AKAZE 실시간 관제
+
+    ORB 관제 탭(LiveMonitorSubTab)과 동일한 UX·레이아웃.
+    내부적으로 AkazeCompareThread 를 사용하여 ORB와 동일한
+    YOLO 크롭·전처리·마스킹·ROI 위에서 AKAZE만 특징 추출기를 교체합니다.
+
+    ▶ 추가 컨트롤: AKAZE 합격 임계값 슬라이더 / Lowe ratio 슬라이더
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet(f"background:{C_BG};")
+        self._thread = None
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+        v.addWidget(self._build_ctrl())
+
+        body = QHBoxLayout()
+        body.setSpacing(0)
+
+        # 좌측 영상 + 슬라이더
+        left_body = QVBoxLayout()
+        left_body.setContentsMargins(0, 0, 0, 0)
+        left_body.setSpacing(8)
+        self.video = VideoDisplayLabel()
+        left_body.addWidget(self.video, stretch=1)
+
+        # 타임라인 슬라이더
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 100)
+        self.slider.setEnabled(False)
+        self.slider.sliderMoved.connect(self._on_seek)
+        self.slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{ border:1px solid {C_BORDER}; background:{C_WHITE}; height:6px; border-radius:3px; }}
+            QSlider::sub-page:horizontal {{ background:{C_GREEN}; border:1px solid #27AE60; height:6px; border-radius:3px; }}
+            QSlider::handle:horizontal {{ background:{C_DARK}; border:1px solid #1A252F; width:14px; margin-top:-4px; margin-bottom:-4px; border-radius:5px; }}
+        """)
+        left_body.addWidget(self.slider)
+        body.addLayout(left_body, stretch=1)
+
+        # 우측 통계 패널 (ORB 탭과 동일한 StatsPanel 재사용)
+        self.stats = StatsPanel()
+        body.addWidget(self.stats)
+        v.addLayout(body, stretch=1)
+
+    # ── 컨트롤 바 (ORB 탭과 동일 구조 + AKAZE 슬라이더 행 추가) ──────
+    def _build_ctrl(self):
+        def _btn(text, color=None, checkable=False, checked=False):
+            b = QPushButton(text)
+            b.setMinimumWidth(72)
+            b.setFixedHeight(28)
+            b.setCheckable(checkable)
+            b.setChecked(checked)
+            if checkable:
+                b.setStyleSheet(
+                    f"QPushButton{{background:{C_BG};color:{C_DARK};"
+                    f"border:1px solid {C_BORDER};border-radius:5px;"
+                    f"font-size:12px;font-weight:500;padding:0 8px;}}"
+                    f"QPushButton:checked{{background:{color if color else C_BLUE};"
+                    f"color:white;border:none;border-radius:5px;"
+                    f"font-size:12px;font-weight:bold;padding:0 8px;}}"
+                )
+            else:
+                bg = color if color else C_BG
+                fg = 'white' if color else C_DARK
+                bd = 'none' if color else f'1px solid {C_BORDER}'
+                b.setStyleSheet(
+                    f"QPushButton{{background:{bg};color:{fg};"
+                    f"border:{bd};border-radius:5px;"
+                    f"font-size:12px;font-weight:bold;padding:0 8px;}}"
+                )
+            return b
+
+        def _sep():
+            f = QFrame()
+            f.setFrameShape(QFrame.VLine)
+            f.setStyleSheet(f"color:{C_BORDER}; max-width:1px; margin:2px 2px;")
+            return f
+
+        # 외부 컨테이너 (3줄: 기존 ORB 2줄 + AKAZE 파라미터 1줄)
+        bar = QWidget()
+        bar.setFixedHeight(128)
+        bar.setStyleSheet(
+            f"background:{C_WHITE}; border:1px solid {C_BORDER}; border-radius:8px;"
+        )
+        vbox = QVBoxLayout(bar)
+        vbox.setContentsMargins(10, 5, 10, 5)
+        vbox.setSpacing(4)
+
+        # ══ 상단 줄: 제목 | 소스 선택 | 재생 제어 | 상태 ══
+        top = QHBoxLayout()
+        top.setSpacing(6)
+
+        lbl_title = QLabel("🟢 AKAZE 실시간 관제")
+        lbl_title.setStyleSheet(
+            f"font-size:13px; font-weight:bold; color:{C_GREEN}; padding-right:2px;"
+        )
+        top.addWidget(lbl_title)
+        top.addWidget(_sep())
+
+        btn_file = _btn("파일 열기", color=C_BLUE)
+        btn_file.clicked.connect(self._open_file)
+        btn_cam  = _btn("카메라 (0번)", color=C_BLUE)
+        btn_cam.clicked.connect(self._open_cam)
+        top.addWidget(btn_file)
+        top.addWidget(btn_cam)
+        top.addWidget(_sep())
+
+        self.btn_pause = _btn("일시 정지", color=C_ORANGE)
+        self.btn_pause.clicked.connect(self._toggle_pause)
+        self.btn_pause.setEnabled(False)
+        btn_stop = _btn("종료", color=C_RED)
+        btn_stop.clicked.connect(self._stop)
+        top.addWidget(self.btn_pause)
+        top.addWidget(btn_stop)
+        top.addStretch()
+
+        self.lbl_st = QLabel("● 대기")
+        self.lbl_st.setStyleSheet(f"font-size:12px; font-weight:bold; color:{C_SUB};")
+        top.addWidget(self.lbl_st)
+
+        # ══ 중간 줄: 옵션 토글 (ORB 탭과 동일) ══
+        mid = QHBoxLayout()
+        mid.setSpacing(6)
+
+        self.btn_skip = _btn("스킵 ON", color=C_BLUE, checkable=True, checked=True)
+        self.btn_skip.clicked.connect(self._toggle_skip)
+        self.btn_clahe = _btn("CLAHE", color=C_YELLOW, checkable=True, checked=True)
+        self.btn_clahe.clicked.connect(self._toggle_clahe)
+        self.btn_crop_view = _btn("크롭 뷰", color="#E67E22", checkable=True, checked=False)
+        self.btn_crop_view.clicked.connect(self._toggle_crop_view)
+
+        mid.addWidget(self.btn_skip)
+        mid.addWidget(self.btn_clahe)
+        mid.addWidget(self.btn_crop_view)
+        mid.addStretch()
+
+        # ══ 하단 줄: AKAZE 전용 파라미터 슬라이더 ══
+        bot = QHBoxLayout()
+        bot.setSpacing(8)
+
+        # 합격 임계값 슬라이더
+        thr_lbl = QLabel("AKAZE 임계값:")
+        thr_lbl.setStyleSheet(f"font-size:11px; color:{C_DARK}; font-weight:bold;")
+        bot.addWidget(thr_lbl)
+
+        self.slider_thr = QSlider(Qt.Horizontal)
+        self.slider_thr.setRange(1, 50)
+        self.slider_thr.setValue(10)
+        self.slider_thr.setFixedWidth(160)
+        self.slider_thr.setStyleSheet(f"""
+            QSlider::groove:horizontal {{border:1px solid {C_BORDER}; background:{C_BG}; height:5px; border-radius:2px;}}
+            QSlider::sub-page:horizontal {{background:{C_GREEN}; border-radius:2px; height:5px;}}
+            QSlider::handle:horizontal {{background:{C_DARK}; width:12px; margin-top:-3px; margin-bottom:-3px; border-radius:4px;}}
+        """)
+        self.slider_thr.valueChanged.connect(self._on_thr_change)
+        bot.addWidget(self.slider_thr)
+
+        self.lbl_thr_val = QLabel("10")
+        self.lbl_thr_val.setFixedWidth(24)
+        self.lbl_thr_val.setStyleSheet(f"font-size:12px; font-weight:bold; color:{C_GREEN};")
+        bot.addWidget(self.lbl_thr_val)
+
+        bot.addWidget(_sep())
+
+        # Lowe ratio 슬라이더
+        lowe_lbl = QLabel("Lowe ratio:")
+        lowe_lbl.setStyleSheet(f"font-size:11px; color:{C_DARK}; font-weight:bold;")
+        bot.addWidget(lowe_lbl)
+
+        self.slider_lowe = QSlider(Qt.Horizontal)
+        self.slider_lowe.setRange(50, 95)
+        self.slider_lowe.setValue(75)
+        self.slider_lowe.setFixedWidth(120)
+        self.slider_lowe.setStyleSheet(f"""
+            QSlider::groove:horizontal {{border:1px solid {C_BORDER}; background:{C_BG}; height:5px; border-radius:2px;}}
+            QSlider::sub-page:horizontal {{background:{C_ORANGE}; border-radius:2px; height:5px;}}
+            QSlider::handle:horizontal {{background:{C_DARK}; width:12px; margin-top:-3px; margin-bottom:-3px; border-radius:4px;}}
+        """)
+        self.slider_lowe.valueChanged.connect(self._on_lowe_change)
+        bot.addWidget(self.slider_lowe)
+
+        self.lbl_lowe_val = QLabel("0.75")
+        self.lbl_lowe_val.setFixedWidth(36)
+        self.lbl_lowe_val.setStyleSheet(f"font-size:12px; font-weight:bold; color:{C_ORANGE};")
+        bot.addWidget(self.lbl_lowe_val)
+
+        bot.addStretch()
+        hint = QLabel("※ ORB 기본 임계값=25 / 0.75")
+        hint.setStyleSheet(f"font-size:10px; color:{C_SUB};")
+        bot.addWidget(hint)
+
+        vbox.addLayout(top)
+        vbox.addLayout(mid)
+        vbox.addLayout(bot)
+        return bar
+
+    # ── 슬라이더 핸들러 ────────────────────────────────────────────
+    def _on_thr_change(self, val):
+        self.lbl_thr_val.setText(str(val))
+        if self._thread:
+            self._thread.set_akaze_threshold(val)
+
+    def _on_lowe_change(self, val):
+        ratio = val / 100.0
+        self.lbl_lowe_val.setText(f"{ratio:.2f}")
+        if self._thread:
+            self._thread.set_akaze_lowe(ratio)
+
+    # ── 옵션 토글 (ORB 탭과 동일) ─────────────────────────────────
+    def _toggle_skip(self):
+        checked = self.btn_skip.isChecked()
+        if self._thread:
+            self._thread.set_skip_enabled(checked)
+        self.btn_skip.setText("스킵 ON" if checked else "스킵 OFF")
+
+    def _toggle_clahe(self):
+        checked = self.btn_clahe.isChecked()
+        self.btn_clahe.setText("CLAHE ON" if checked else "CLAHE OFF")
+        if self._thread:
+            self._thread.set_clahe(checked)
+
+    def _toggle_crop_view(self):
+        checked = self.btn_crop_view.isChecked()
+        self.btn_crop_view.setText("크롭 ON" if checked else "크롭 뷰")
+        if self._thread:
+            self._thread.set_show_crop(checked)
+
+    # ── 소스 열기 ──────────────────────────────────────────────────
+    def _open_file(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "영상 파일", _ROOT, "Video (*.mp4 *.avi *.mov *.mkv)")
+        if p:
+            self._start(p)
+
+    def _open_cam(self):
+        self._start(0)
+
+    def _on_seek(self, value):
+        if self._thread:
+            self._thread.set_frame(value)
+
+    # ── 스레드 생명주기 ────────────────────────────────────────────
+    def _start(self, src):
+        self._stop()
+        self.stats.pie.reset_cumulative()
+
+        thr_val  = self.slider_thr.value()
+        lowe_val = self.slider_lowe.value() / 100.0
+        self._thread = AkazeCompareThread(
+            src,
+            akaze_lowe_ratio=lowe_val,
+            akaze_threshold=thr_val,
+        )
+        self._thread.akaze_frame.connect(
+            lambda qi: self.video.set_frame(QPixmap.fromImage(qi)))
+        self._thread.akaze_stats.connect(self._on_akz_stats)
+        self._thread.progress_signal.connect(self._on_progress)
+        self._thread.start()
+
+        self.btn_pause.setEnabled(True)
+        self.btn_pause.setText("⏸ 일시 정지")
+        self.btn_pause.setStyleSheet(
+            f"background:{C_ORANGE};color:white;border:none;border-radius:6px;font-weight:bold;")
+        self.slider.setEnabled(True)
+        self.lbl_st.setText("● 분석 중...")
+        self.lbl_st.setStyleSheet(
+            f"font-size:12px; font-weight:bold; color:{C_BLUE}; padding-left:6px;")
+
+    def _stop(self):
+        if self._thread and self._thread.isRunning():
+            self._thread.stop()
+        self._thread = None
+        self.btn_pause.setEnabled(False)
+        self.slider.setEnabled(False)
+        self.slider.setValue(0)
+        self.lbl_st.setText("● 정지")
+        self.lbl_st.setStyleSheet(
+            f"font-size:12px; font-weight:bold; color:{C_SUB}; padding-left:6px;")
+
+    def _toggle_pause(self):
+        if self._thread:
+            self._thread.pause_resume()
+            if self._thread._paused:
+                self.btn_pause.setText("▶ 계속 재생")
+                self.btn_pause.setStyleSheet(
+                    f"background:{C_GREEN};color:white;border:none;border-radius:6px;font-weight:bold;")
+                self.lbl_st.setText("● 일시 정지됨")
+                self.lbl_st.setStyleSheet(
+                    f"font-size:12px; font-weight:bold; color:{C_ORANGE}; padding-left:6px;")
+            else:
+                self.btn_pause.setText("⏸ 일시 정지")
+                self.btn_pause.setStyleSheet(
+                    f"background:{C_ORANGE};color:white;border:none;border-radius:6px;font-weight:bold;")
+                self.lbl_st.setText("● 분석 중...")
+                self.lbl_st.setStyleSheet(
+                    f"font-size:12px; font-weight:bold; color:{C_BLUE}; padding-left:6px;")
+
+    # ── 시그널 수신 ────────────────────────────────────────────────
+    def _on_progress(self, cur, tot):
+        if not self.slider.isSliderDown():
+            if self.slider.maximum() != tot:
+                self.slider.setRange(0, tot)
+            self.slider.blockSignals(True)
+            self.slider.setValue(cur)
+            self.slider.blockSignals(False)
+
+    def _on_akz_stats(self, fps, yolo_ms, pre_ms, ext_ms, cmp_ms, score, is_ok):
+        """AKAZE 결과를 ORB 탭과 동일한 StatsPanel에 표시"""
+        self.stats.update_stats(
+            fps, yolo_ms, pre_ms, ext_ms, cmp_ms,
+            score, is_ok)
+        col = C_GREEN if is_ok else C_RED
+        st_text = "● PASS ✅" if is_ok else "● FAIL ❌"
+        self.lbl_st.setText(st_text)
+        self.lbl_st.setStyleSheet(
+            f"font-size:12px; font-weight:bold; color:{col}; padding-left:6px;")
+
+    def closeEvent(self, e):
+        self._stop()
+        super().closeEvent(e)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  최종 MonitorTab (서브탭 A + 서브탭 B + 서브탭 C + 서브탭 D + 서브탭 E)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class MonitorTab(QWidget):
     def __init__(self):
@@ -2495,6 +3854,8 @@ class MonitorTab(QWidget):
         sub.addTab(self.live_tab,            "  🎥  실시간 Live 관제  ")
         sub.addTab(TargetROITab(),           "  🎯  타겟 뷰어 & ROI 설정  ")
         sub.addTab(SiameseMonitorSubTab(),   "  🧬  샴 네트워크 관제  ")
+        sub.addTab(PhoneMonitorSubTab(),     "  📱  모바일 기기 관제  ")
+        sub.addTab(AkazeBenchmarkSubTab(),   "  ⚖️  ORB vs AKAZE 비교  ")  # [신규] A/B 비교 탭
         v.addWidget(sub)
 
     def on_params_reloaded(self):

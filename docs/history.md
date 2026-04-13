@@ -1,3 +1,1383 @@
+## [2026-04-13] 🐛 샴 라벨링 pending 수집 임계값 불일치 수정 — YOLO 성공/실패에 따른 threshold 이원화
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 요청**: 샴 라벨링에서 ORB 매칭 ±2 기준으로 pending 수집이 올바르게 동작하는지 확인.
+- **분석 파일**: `gui/tab_monitor.py` — VideoThread `_compare_single_target`, `connect_phone/server/app.py` — `_compare`
+
+### 📐 설계 원칙 확인 (임계값 이원화)
+| 상황 | 비교 대상 | 사용 임계값 |
+|---|---|---|
+| YOLO 성공 → 크롭 이미지 | `orb_compare_threshold=25` | 정상 합격 기준 (클린 이미지) |
+| YOLO 실패 → 원본 전체 이미지 | `final_pass_threshold=60` | 최후 수단 (노이지한 전체 비교) |
+| ROI 설정 시 각 ROI 크롭 | `roi_match_threshold=7` | ROI 단위 소형 크롭 |
+
+### ⚠️ 발견된 버그 2건
+
+| # | 위치 | 기존 코드 | 문제 | 수정 |
+|---|---|---|---|---|
+| 1 | `VideoThread._compare_single_target` | `threshold=self._final_pass_threshold` 고정 | YOLO 성공 여부 무관하게 `final_pass_threshold=60` 사용 → 정상 경로(YOLO 성공+크롭)에서도 잘못된 임계값 | `active_bbox` 유무로 `orb_compare_threshold` / `final_pass_threshold` 분기 |
+| 2 | `app.py._compare` | `threshold=self.final_pass_threshold` 고정 | 동일 문제 — `yolo_hit` 무관하게 60 고정 | `yolo_hit` 여부로 분기 |
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **`gui/tab_monitor.py` — `_compare_single_target` (VideoThread 내부 클로저)**
+  ```python
+  thr = self.matcher.orb_compare_threshold if active_bbox is not None else self._final_pass_threshold
+  s, p = self.matcher.compare_descriptors(full_des_cache, t_data.get('full'), threshold=thr)
+  ```
+- **`gui/tab_monitor.py` — pending 수집 조건**
+  ```python
+  _pending_ref = self.matcher.orb_compare_threshold if active_bbox is not None else self._final_pass_threshold
+  if roi_total == 0 and abs(score - _pending_ref) <= 2:
+  ```
+- **`connect_phone/server/app.py` — `_compare` (process 내부 클로저)**
+  ```python
+  thr = self.matcher.orb_compare_threshold if yolo_hit else self.final_pass_threshold
+  s, p = self.matcher.compare_descriptors(full_des_cache, t_data.get("full"), threshold=thr)
+  ```
+
+---
+
+## [2026-04-13] 🐛 판별력 계산식 버그 수정 — 임계값 추정 공식 및 오탐 기준 수정
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 요청**: 판별력 계산식이 올바른지 확인 후 수정.
+- **분석 파일**: `gui/tab_guide.py` — `GroundTruthOptimizerThread`, `ParamOptimizerThread` 두 클래스
+
+### ⚠️ 발견된 버그 3건
+
+| # | 위치 | 기존 코드 | 문제 | 수정 |
+|---|---|---|---|---|
+| 1 | `GroundTruthOptimizerThread` | `fp_count = sum(s > 0)` | 점수가 1이라도 있으면 오탐으로 집계 → fp_rate 과대 표시 | `s >= match_thr` |
+| 2 | `GroundTruthOptimizerThread` | `match_thr = avg_wrong + 2` | 정답 점수(`avg_correct`) 미반영 → gap 좁을 때 정답도 FAIL | `(avg_correct + avg_wrong) / 2` (중간값) |
+| 3 | `ParamOptimizerThread` | `orb_thr = max_cross + 2` | `min_self` 미반영 → gap 좁을 때 정답(자기 매칭 최솟값)도 FAIL | `(min_self + max_cross) // 2` (중간값) |
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **`gui/tab_guide.py` — `GroundTruthOptimizerThread`**
+  - `fp_count` 계산을 `if avg_margin > best_margin` 블록 안으로 이동 (match_thr 계산 후에 써야 하므로)
+  - `match_thr` 공식: `int(avg_wrong) + 2` → `int((avg_correct + avg_wrong) / 2)`
+  - `fp_count` 기준: `s > 0` → `s >= match_thr`
+- **`gui/tab_guide.py` — `ParamOptimizerThread`**
+  - `orb_thr` 공식: `max_cross + 2` → `(min_self + max_cross) // 2`
+
+### ℹ️ 정상 확인된 부분
+- `BayesianAutoTuner._score()` (offline/auto_tuner.py) — 판별력 공식, 정규화, 합성 점수 모두 올바름
+- `gap = min_self - max_cross` 자체 계산식 — 올바름
+- `GroundTruthOptimizerThread`의 margin 계산 (`correct - best_w`) — 올바름
+
+---
+
+## [2026-04-13] ✅ 네이밍 리팩터링 완료 — `match_threshold` / `MATCH_THRESHOLD` → 명확한 이름으로 전면 교체
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **작업 배경**: 직전 세션(2026-04-13 20:31)에서 두 임계값의 역할 혼란이 발견되었으며, 리네이밍을 "향후 과제"로 기록함.
+- **이번 세션**: 기록된 계획대로 6개 파일 전체에 걸쳐 리네이밍 및 코드 정리 수행.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+
+| 구 이름 | 신 이름 | 역할 |
+|---|---|---|
+| `match_threshold` | `orb_compare_threshold` | ORB 개별 비교 합격 컷오프 (기본값 25) |
+| `MATCH_THRESHOLD` | `final_pass_threshold` | 최종 합격/불합격 판정 기준 (기본값 60) |
+| `MATCH_THRESHOLD` (모듈 상수) | `FINAL_PASS_THRESHOLD` | tab_monitor.py 모듈 레벨 상수 |
+
+**수정 파일:**
+- `engine/matcher.py` — `ScreenMatcher.__init__` 파라미터, `self.orb_compare_threshold`, `compare_descriptors` docstring
+- `connect_phone/server/app.py` — `ScreenMatcher` 생성자 호출, `self.final_pass_threshold`, 초기화 로그
+- `gui/tab_monitor.py` — 모듈 상수, `_load_params_config` defaults, VideoThread(×2), AkazeThread, pending 캡처 조건
+- `gui/tab_guide.py` — `DEFAULT_CONFIG`, `load_params_config`, 두 Optimizer Thread의 `best_params` 딕셔너리 및 출력 문자열, 파라미터 descriptor
+- `gui/tab_param_viz.py` — `PassSearchThread.__init__` 파라미터 및 내부 속성
+- `scripts/pipeline_test.py` — `ScreenMatcher` 생성 호출
+- `offline/auto_tuner.py` — 주석 문자열
+
+**하위 호환 처리:**
+- `tab_monitor._load_params_config()` 및 `tab_guide.load_params_config()`에 구 키 자동 마이그레이션 로직 추가.
+- 기존 `params_config.json`에 `match_threshold` / `MATCH_THRESHOLD` 키가 남아 있어도 자동으로 신 키로 변환 후 로드됨.
+
+---
+
+## [2026-04-13 20:31] 🔍 match_threshold vs MATCH_THRESHOLD 코드 분석 — 네이밍 혼란 및 불일치 발견
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 질문**: "파라미터 설정에 `match_threshold`와 `MATCH_THRESHOLD` 두 개가 있는데 왜 이렇게 되어있냐?"
+- **분석 결과**: 두 값은 서로 완전히 다른 역할을 하는 별개의 임계값이나, 네이밍이 너무 유사해 혼란 유발.
+
+### 📊 역할 분리표
+
+| 항목 | `match_threshold` (소문자) | `MATCH_THRESHOLD` (대문자) |
+|---|---|---|
+| params_config.json 값 | 25 | 30 |
+| 코드 하드코딩 기본값 | 25 | **60** (불일치!) |
+| 쓰이는 곳 | `ScreenMatcher()` 생성자에 전달 | `VideoThread._match_threshold`로 저장 |
+| 역할 | ORB 매처 내부 개별 비교 합격 기준 | 전체 이미지 폴백 모드의 최종 합격/불합격 판정 |
+| 적용 범위 | ROI 있는 경우 ROI별 비교 | `roi_total == 0`일 때만 사용 |
+
+### ⚠️ 발견된 문제점 (버그 후보)
+1. **네이밍 혼란**: 대소문자 하나 차이로 완전히 다른 역할. 신규 개발자 혼동 필연적.
+2. **값 불일치**: 코드 기본값 `MATCH_THRESHOLD=60`, config 저장값 `MATCH_THRESHOLD=30` → config가 항상 이기므로 실제로는 30 동작 중. 코드와 현실이 불일치.
+3. **pending 수집 기준**: 방금 수정한 `roi_total == 0 and abs(score - self._match_threshold) <= 3`이 대문자 기준(30)으로 동작하지만, ORB 매처가 사용하는 소문자(25)와 다름.
+
+### 🛠️ 향후 과제 (미적용, 승인 후 진행)
+- 리네이밍 권장:
+  - `match_threshold` → `orb_compare_threshold` (ORB 개별 비교 최소 매칭 수)
+  - `MATCH_THRESHOLD` → `final_pass_threshold` (최종 합격 판정 기준 점수)
+- 코드 기본값(`MATCH_THRESHOLD=60`)과 config 값(30)의 불일치 정리 필요
+
+---
+
+## [2026-04-13 20:25] 🔧 pending 수집 로직 수정 — ROI 모드 제외, match_threshold 단독 기준으로 단순화
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 질문**: "샴 라벨링 탭에서 커트라인 점수의 ±10% 이내 점수인 이미지만 수집하는 게 맞냐?"
+- **코드 확인 결과**: ±10%가 아닌 **고정 절대값 ±2~3점** 방식이었으며, ROI 모드(roi_total>0)와 전체 이미지 모드 모두 pending 수집 대상이었음.
+- **사용자 요청**: "ROI 모드는 pending 수집에서 제외하고, match_threshold 값으로만 판단해 달라."
+- **결정**: `roi_total == 0`일 때만 `match_threshold ± 3점` 조건으로 수집하도록 단일 조건으로 단순화.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed** `gui/tab_monitor.py` (라인 1227~1236):
+  - 기존 (ROI/전체 이미지 양쪽 수집):
+    ```python
+    margin = 2 if roi_total > 0 else 3
+    target_thr = self._roi_match_threshold if roi_total > 0 else self._match_threshold
+    if abs(score - target_thr) <= margin:
+    ```
+  - 수정 후 (전체 이미지 모드만, match_threshold 기준):
+    ```python
+    if roi_total == 0 and abs(score - self._match_threshold) <= 3:
+    ```
+- **Changed** `gui/tab_monitor.py` (라인 28 주석): pending 동작 설명 주석을 수정된 로직에 맞게 업데이트.
+
+---
+
+## [2026-04-13 19:48] 🎙️ 발표 스크립트 수정 — ArcFace Loss 디테일 추가
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 요청**: "팀원이 제안한 발표 대본에 들어있던 `ArcFace Loss` 내용은 기술적으로 좋은 어필 포인트가 될 것 같으니, 우리가 짠 대본 초안에도 추가해 달라."
+- **조치 사항**: 기존 대본의 [슬라이드 7] '모델 다각화' 논조 안에, 소량 데이터 제약을 극복하고 정확도 93.9%를 달성한 구체적 성과 지표로서 `ArcFace Loss` 도입 사실을 매끄럽게 융합.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed** `docs/발표용_10분_대본_초안.md`:
+  - [슬라이드 7] 내용 수정: '적은 데이터로도 특성 간의 간격을 강제로 벌려 구분 짓는 ArcFace Loss 기법 도입으로 학습 정확도 93.9% 달성' 문구 추가.
+
+---
+
+## [2026-04-13 19:43] 🎙️ 발표 스크립트 수정 — 트랙 B 모델 다각화 기조 반영
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 요청**: "대본 슬라이드 7에서 샴 네트워크를 실패 및 포기로 단정 짓지 말고, 샴 네트워크도 계속 개선 및 고려 중이며 다른 여러 모델들과 함께 테스트 중인 상태로 설명하면 좋겠다."
+- **조치 사항**: 단정적 실패 선언 대신 엔지니어링 관점에서 합리적인 "모델 다각화(다중 후보군 테스트)" 기조로 서술을 변경.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed** `docs/발표용_10분_대본_초안.md`:
+  - [슬라이드 7] 내용 수정: '샴 네트워크의 배신'이라는 포기 프레임을 '모델 다각화'로 변경. 샴 네트워크 파라미터 개선, 다른 딥러닝 모델 병행 테스트, 그리고 VLM 기반 자동 라벨링 기술까지 종합적으로 '테스트 및 구성 중'이라는 능동적 방어 논리로 구어체를 다듬어 반영함.
+
+---
+
+## [2026-04-13 19:41] 🛡️ CTQ 판별력 및 병렬 합격 판정 설명 논리 2단계 고도화
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 요청 1 (판별력 산식 엄밀화)**: "단순 (정답-오답) 평균이 아니라, 각 타겟별로 묶어서 평균을 낸 뒤 다시 최종 평균을 내는 이중 평균(타겟별 평균의 평균) 로직이 들어가야 한다. 특정 타겟 하나만 높아서 생기는 오류를 방지하는 취지를 명확히 해야 함."
+- **사용자 요청 2 (병렬 처리 오류 방지)**: "병렬 연산 시 어느 하나가 합격점을 넘는다고 덜컥 통과시키는 게 아니라, 끝까지 싹 다 비교해 보고 최고점 하나만 통과시키는 보수적 로직을 설명에 넣어야 함."
+- **조치 사항**: 제시한 엔지니어링 의도(어뷰징 방지 및 가짜 데이터의 조기 오판 차단)를 대본 및 팀 공유용 문서의 CTQ 항목에 전면 반영.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed** `docs/발표용_10분_대본_초안.md`:
+  - 3대 CTQ 설명 파트 수정: 판별력을 단순 평균이 아닌 '타겟별 평균의 2중 평균' 구조로 설명하여 착시(왜곡) 방어 장치임을 명확히 구어체로 기술.
+  - 병렬 판정 보수적 대기 로직 추가: '아슬아슬한 오답 화면이 연산이 0.01초 빨리 끝났다는 이유로 오판되는 것을 막기 위해 모든 연산을 기다렸다가 절대 최고 득점 하나만 합격시킴'이라고 명시.
+- **Changed** `docs/팀원_공유용_프로젝트_구조_및_로직.md`:
+  - **CTQ 표 수정**: 판별력 계산 공식을 "타겟별 평균값들의 최종 평균"으로 변경.
+  - **설계 근거 항목 추가**: 스트리밍 조기 판정 억제 (병렬 안전장치) 항목을 추가하여 Early Return을 방지하고 `max` 값을 취하는 구조를 문서화.
+
+---
+
+## [2026-04-13 19:27] 🎙️ 10분 발표용 스크립트 대본 초안 작성 완료
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 요청**: 투트랙 전략(A/B)의 탄생 배경, 초기 타겟 1 인식 실패와 해결 과정(Multi ROI → 다각형 세그멘테이션), 트랙 B의 샴 네트워크 실패 및 VLM(시각 언어 모델) 연계 아이디어, AutoML(Optuna)의 최적화 원리와 3대 CTQ의 실제 계산법, 그리고 모바일/서버 연동의 현실적 제약과 해결책까지 모두 엮은 10분짜리 발표 대본 작성 요청.
+- **주요 방어 로직(디테일 보강)**:
+  - 0.1초 처리속도의 현실 한계 인정: 구형 PC와 무선 네트워크 고려, 초당 5프레임 제한 및 큐잉(최신 프레임 갱신) 로직 강조.
+  - CTQ 예시 추가: "정답 점수 45점이면, 오답은 35점 이하여야 안전 마진 10점 통과" 등 구어체 설명.
+  - Optuna 최적화 원리 시각화: 수만 가지 조합 중 지역 최솟값(Local Minima)에 빠지지 않고 전역 최적값(Global Optimum)을 찾기 위해 초기 15%를 강제 Warm-up으로 넓게 찌르는 탐색 과정 설명.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Added** `docs/발표용_10분_대본_초안.md`:
+  - 5단계 구성(도입 → 트랙 A 시행착오 → 트랙 B 진화와 CTQ → 현장 적용성 → 결론 및 향후 계획)으로 짜인 발표용 마크다운 대본 신규 생성.
+
+---
+
+## [2026-04-13 17:05] 🔧 CTQ 문서 사실 오류 정정 — avg_ms 범위 및 YOLO 직렬 적체 구조 명확화
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 지적 1**: "`처리 속도 40ms` 기준이 ORB 전처리를 말하는 것이냐?" → **맞음.** `avg_ms`는 YOLO를 제외한 ORB 전처리+특징점 추출만 측정하는 지표임을 문서에 명시.
+- **사용자 지적 2**: "YOLO는 각 폰마다 따로따로 같은 속도가 아니라 힘이 분산되는 구조 아니냐?" → **맞음 (분산이 아니라 직렬 적체).** YOLO는 `max_workers=1`로 단 하나의 처리 창구만 존재. 폰 N대 접속 시 각 폰의 YOLO 대기 시간은 N배로 증가하는 구조적 사실을 문서에 정확히 기술.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Fixed** `docs/팀원_공유용_프로젝트_구조_및_로직.md` (섹션 0.5 CTQ):
+  - CTQ 표 3번 항목 지표명: `처리 속도` → `ORB 전처리 속도 (ORB Processing Speed)` (YOLO 미포함 명시)
+  - 설계 근거 설명 전면 교정:
+    - 기존 (오류): "YOLO(50~80ms) + ORB(≤40ms) + 네트워크를 합쳐도 폰 1대당 약 150~200ms 이내"
+    - 수정 (정확): `avg_ms`는 ORB만 측정, YOLO는 `max_workers=1` 직렬 처리로 폰 N대 접속 시 N배 적체 발생
+    - 폰 1대/2대/3대 기준 실질 레이턴시 예측 표 추가 (1대:~120~150ms / 2대:~170~230ms / 3대:~220~310ms)
+
+---
+
+## [2026-04-13 17:01] 🎯 시스템 품질 목표(CTQ) 정의 및 문서화
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 질문**: "KPI/CTQ 같은 목표 설정이 명확하지 않은 것 같다. 판별력과 통과율 기준으로 설명하는 게 좋을까? 모델의 통과 기준을 정해야 할 것 같다."
+- **분석 결과**: 기존 코드에 `pass_rate`, `disc_score`, `avg_ms` 세 지표가 이미 구현되어 있었으나, "몇 점 이상이면 합격인가?"라는 CTQ 기준선이 어디에도 정의되어 있지 않았음.
+- **결정**: 품질 공학(CTQ) 언어를 활용해 발표·팀 합의·파라미터 저장 기준을 통일. 3-CTQ 체계(정인식률 / 안전 마진 / 처리 속도)로 정의.
+
+### 📋 확정된 3-CTQ 합격 기준 (ORB 트랙 A)
+
+| CTQ 지표 | 측정 항목 | **합격 기준** | 근거 |
+|---|---|---|---|
+| 정인식률 (Correct ID Rate) | `pass_rate` | **≥ 90%** | 10장 중 9장 이상 맞혀야 현장 신뢰 확보 가능 |
+| 안전 마진 (Safety Margin) | `disc_score` | **≥ +10점** | ORB 자연 노이즈 ±5~8점 감안, 10점 이상 여유 확보 필요 |
+| 처리 속도 (Throughput Speed) | `avg_ms` | **≤ 40ms** | 전체 파이프라인 150~200ms 이내 유지 조건 |
+
+- **AND 조건**: 세 항목 동시 통과 시에만 해당 파라미터 조합을 최적 파라미터로 인정.
+- **트랙 B (딥러닝) CTQ**: 코사인 유사도 자기 일치도 ≥ 95%, 타겟 간 최대 혼동율 ≤ 10%, 추론 지연 ≤ 50ms (검증 진행 중)
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Added** `docs/팀원_공유용_프로젝트_구조_및_로직.md` (섹션 0.5 신설):
+  - `🎯 0.5. 시스템 품질 목표 (CTQ — Critical to Quality)` 섹션 추가 (섹션 0 프로젝트 개요 직후)
+  - 3-CTQ 합격 기준표 (정인식률/안전 마진/처리 속도) + 합격 기준 수치 명시
+  - 현재 달성 현황 표 (중간 점검 기준) — 속도만 ✅ 달성, 나머지 🔄 개선 중
+  - 각 CTQ 기준의 수학적 선정 근거 서술
+  - 트랙 B (딥러닝) 별도 CTQ 기준표
+
+---
+
+## [2026-04-13 16:55] 🛡️ Optuna 파라미터 최적화 신뢰성 강화 — Warm-up 안전장치 도입 + 발표용 문서 Q6 추가
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 질문**: "파라미터 학습 시 UI에 보여주는 상관관계 계수값을 보고 최적화 학습을 하는 거냐? 이 로직에 문제는 없냐?"
+- **냉정한 분석 결과**: 코드 점검 결과 3가지 맹점 확인
+  1. `TPESampler` 기본 `n_startup_trials=10`이 너무 적어 초반 우연한 결과를 신뢰한 채 탐색 범위를 좁혀버리는 **지역 최적화 함정(Local Minima)** 위험
+  2. Spearman 상관계수는 비선형 관계(임계값 타격 시 급변)를 완전히 잡지 못해 맹신 시 위험
+  3. 평가 데이터가 `gt_labeled` 단일 폴더에 종속되어 촬영 환경 변화 시 과적합 가능성
+- **수정 결정**: 옵션1(코드 즉시 수술) 선택 + 발표용 문서 Q6 신설하여 발표 대비
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Changed** `gui/tab_param_viz.py` (`_run_optuna` 메서드):
+  - `optuna.create_study(sampler=TPESampler(seed=42))` → `TPESampler(seed=42, n_startup_trials=n_warmup)`
+  - `n_warmup = max(30, int(self.n_trials * 0.15))` — 전체 시도수의 15%(최소 30회) Warm-up 강제 선행
+  - 주석으로 안전장치 이유와 기존 기본값의 위험성 명시
+- **Changed** `offline/auto_tuner.py` (`run_night_tuning` 메서드):
+  - 동일한 `n_startup_trials` Warm-up 안전장치를 야간 배치 튜너에도 동일하게 적용
+  - `optuna.create_study(direction="maximize")` → `TPESampler(seed=42, n_startup_trials=n_warmup)` 명시
+- **Changed** `docs/팀원_공유용_프로젝트_구조_및_로직.md`:
+  - 섹션 4 (파라미터 튜닝 탭): 시각화 대시보드 기능 목록과 안전장치 적용 사실 추가
+  - 섹션 8 ④ (향후 과제): Warm-up 안전장치 도입 완료 사실 명시
+  - 섹션 9 Q2 답변: 탐색 신뢰성 안전장치 항목 추가
+  - **섹션 9 Q6 신설**: "파라미터 최적화가 정말 신뢰할 수 있나요?" — 상관계수 역할 정확한 정의, Warm-up 후 효과, Taboo 블랙리스트 메커니즘, 솔직한 한계점 명시
+  - 섹션 10 (용어사전): Warm-up, 지역 최적화 함정(Local Minima), Spearman 상관계수 3개 항목 신규 추가
+
+---
+
+## [2026-04-13 10:09] ✅ ORB vs AKAZE A/B 비교 관제 탭 구현 완료
+
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 요청**: 기존 코드를 전혀 건드리지 않으면서, 실시간 관제 탭 안에 ORB와 AKAZE를 동시 비교할 수 있는 새 서브탭 추가.
+- **구현 전략**: `tab_monitor.py` 맨 끝에 신규 클래스만 append. 기존 `VideoThread`, `ScreenMatcher`, `matcher.py` 등 모든 기존 파일 무수정.
+- **변인 통제**: 동일 프레임에서 YOLO 크롭(1회 실행 공유) → 전처리(blur→gamma→CLAHE→sharpen) → 마스킹·ROI를 모두 동일하게 적용한 뒤, 특징 추출기만 ORB vs AKAZE로 분리.
+- **AKAZE 파라미터**: `AKAZE_DESCRIPTOR_MLDB` (이진 디스크립터) + `NORM_HAMMING` 매처. 임계값은 UI 슬라이더로 실시간 조절(기본값 10, 범위 1~50). Lowe's ratio도 슬라이더(0.50~0.95, 기본 0.75).
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Added** `gui/tab_monitor.py` (맨 끝에 추가, 기존 코드 무수정):
+  - `_akaze_load_targets()` — ORB의 `load_targets_from_dir`과 동일 로직, 추출기만 AKAZE
+  - `_akaze_compare()` — Lowe's ratio test 기반 AKAZE 매칭 헬퍼
+  - `AkazeCompareThread(QThread)` — 동일 프레임에 ORB+AKAZE 동시 실행, 각각 pyqtSignal emit
+  - `_ABStatsCard(QWidget)` — ORB/AKAZE 각 결과 표시용 소형 KPI+박스플롯 카드
+  - `AkazeBenchmarkSubTab(QWidget)` — 좌(ORB)/우(AKAZE) 분할 뷰 + 슬라이더 바 + 하단 통계 카드
+- **Changed** `gui/tab_monitor.py` (`MonitorTab.__init__` 한 줄만):
+  - `sub.addTab(AkazeBenchmarkSubTab(), "  ⚖️  ORB vs AKAZE 비교  ")` 추가
+
+---
+
+## [2026-04-13 10:04] 🎯 (계획) 실시간 검출 파이프라인 AKAZE 도입 및 A/B 테스트 환경 구축
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **현재 문제**: 다중 기기 연결 시 YOLO 분할(Seg)과 ORB 조합의 추론 속도 저하, 그리고 원근 변화에 취약한 ORB 인식률 문제 발생.
+- **해결 방안 확정**: 분할(Seg) 모델을 상자(Box) 검출 모델로 교체하여 확보한 속도를 기반으로, 원근과 크기 변화에 훨씬 강한 AKAZE 특징 추출기를 도입하기로 함.
+- **테스트 방법 (A/B 테스트)**: 전면 교체 전 정확도/속도 검증을 위해 기존의 '실시간 검출 탭' 안에 [ORB 모드 / AKAZE 모드]를 선택할 수 있는 서브 탭 혹은 스위치를 추가하기로 함.
+- **변인 통제 합의**: 두 알고리즘의 공정한 성능 비교를 위해 마스킹, 다중 ROI 분할, 기존 이미지 전처리 필터는 모두 100% 동일하게 유지. 최대로 추출하는 특징점 개수 역서 700개로 동일하게 통제하되, 매칭 합격 거리(기준점)는 AKAZE에 맞게 동적으로 테스트(예: UI 내 슬라이더)할 수 있도록 함.
+- **안전성 (Roleback)**: 롤백 가능한 코드를 보장하기 위해 기존 파이프라인 파일을 덮어쓰거나 지우지 않고 분기점(if/else)으로만 기능을 추가하는 방식으로 진행 합의.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- *(✅ 아래 세션에서 완료됨)*
+
+---
+
+## [2026-04-12] 📱 모바일 서버 연결 안정화 — 크래시 3종 수정 + YOLO 다중 클라이언트 성능 개선
+
+> **상태**: ✅ 완료 (YOLO stdout 보호 적용 중 / 서버 안정 확인)
+
+### 💬 문제 요약
+
+폰을 연결하면 UI 조작 시 연결이 끊기고, 서버를 껐다 켜야 하는 현상이 연속으로 발생.  
+근본 원인은 3개의 독립된 버그가 겹쳐있었음.
+
+---
+
+### 🐛 버그 1 — 서버 비정상 종료 시 GUI가 감지 못 함
+
+**현상**: 서버 subprocess가 죽어도 GUI는 "● 서버 실행 중"으로 표시, 시작 버튼 비활성화.  
+**원인**: `_read_log()` 스레드가 stdout EOF를 감지해도 GUI에 알리는 경로가 없었음.
+
+**수정** (`gui/tab_mobile.py`):
+- `_server_died = pyqtSignal(int)` 클래스 변수 추가
+- `_read_log(proc)` → stdout 루프 종료 후 `proc.wait(timeout=2.0)` → `_server_died.emit(exit_code)`
+- `_on_server_crashed()` 핸들러 추가: 상태 표시 업데이트 + 시작 버튼 재활성화
+- `proc.poll() or -1` 버그 수정 → `0 or -1 = -1` 으로 exit code 0을 -1로 오인하던 문제
+
+---
+
+### 🐛 버그 2 — YOLO가 subprocess stdout 파이프를 닫아 서버 크래시
+
+**현상**: 서버 시작 로그에 "YOLO 로드: best.pt" 이후 "⚠️ stdout 파이프 끊김 → 강제 종료" 출력, exit=-999 또는 exit=1.  
+**원인**: ultralytics/Rich가 non-TTY(파이프) 환경을 감지해 `sys.stdout`을 교체·닫음 → 부모(GUI) pipe EOF → "서버 죽음"으로 오인 → 강제 종료.  
+`CUDA_VISIBLE_DEVICES=""` 설정 후에도 동일 재현.
+
+**1차 잘못된 수정**: YOLO를 서버에서 완전히 제거 → 매칭 점수 0~11 → 모두 FAIL, YOLO 기능 상실.
+
+**최종 수정** (`connect_phone/server/app.py`):
+```python
+# stdout 보호 래퍼 (파일 상단, uvicorn 시작 전 적용)
+_pipe_stdout = sys.stdout
+
+class _ProtectedStdout:
+    def write(self, s): ...
+    def flush(self): ...
+    def close(self): pass   # 닫기 완전 차단
+    @property
+    def closed(self): return False
+    ...
+
+sys.stdout = _ProtectedStdout(_pipe_stdout)
+
+def _restore_stdout():
+    if not isinstance(sys.stdout, _ProtectedStdout):
+        sys.stdout = _ProtectedStdout(_pipe_stdout)
+```
+- YOLO 로드(`BezelDetector(...)`) 완료 후 `_restore_stdout()` 호출 → sys.stdout 복원
+- ultralytics가 교체해도 원본 파이프 참조(`_pipe_stdout`)는 GC 되지 않으므로 파이프 유지
+
+---
+
+### 🐛 버그 3 — 서버 subprocess 로그 한글 깨짐
+
+**현상**: 로그에 "濡쒕뱶" 등 CP949로 잘못 디코딩된 문자 출력.  
+**원인**: `subprocess.Popen(text=True)` 사용 시 Windows 기본 인코딩(CP949)으로 파이프 읽음. 서버 소스는 UTF-8.
+
+**수정** (`gui/tab_mobile.py`):
+```python
+env = os.environ.copy()
+env["PYTHONIOENCODING"] = "utf-8"
+proc = subprocess.Popen(
+    [...],
+    text=True,
+    encoding="utf-8",   # CP949 → UTF-8 강제
+    env=env,
+)
+```
+
+---
+
+### ⚡ 성능 — 폰 3대 동시 연결 시 YOLO 딜레이 279ms → 개선
+
+**현상**: 폰 1대 기준 ~80ms이던 YOLO 추론이 3대 연결 시 ~279ms로 급증.  
+**원인**: 3개 worker가 동시에 `run_in_executor(None, process, frame)` 호출 → 기본 ThreadPool에서 3개 YOLO 추론 동시 실행 → CPU 경합.
+
+**수정** (`connect_phone/server/app.py`):
+```python
+# 전역 단일 스레드 YOLO 실행기
+_yolo_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="yolo")
+
+# worker 내부
+result = await loop.run_in_executor(_yolo_pool, _pipeline.process, frame_bytes)
+```
+- YOLO 추론 직렬화 → CPU 경합 제거
+- asyncio 큐(`maxsize=2`)가 오래된 프레임 자동 드롭 → latency 누적 방지
+- 예상 결과: 폰 3대에서 각 ~100ms 이하 (순차 처리이나 최신 프레임만 처리)
+
+---
+
+### 기타 수정 사항
+
+- `gui/tab_mobile.py`: uvicorn에 `--ws-ping-interval 20 --ws-ping-timeout 10` 추가 → 끊긴 폰 연결 조기 감지
+- `gui/tab_mobile.py`: `log_box.document().setMaximumBlockCount(500)` → 로그 무한 증가 방지
+- `connect_phone/server/app.py`: `_frame_count % 30 == 0` 로그 스로틀링 → 매 프레임 print() 파이프 부하 방지
+- `connect_phone/server/app.py`: `worker()` 예외 시 `break → continue` (연결 유지)
+- `gui/tab_mobile.py`: `proc.wait(timeout=2.0)` → Windows 경쟁 조건에서 exit code 확실히 읽기
+
+---
+
+## [📋 계획 — 다음 세션] 📱 모바일 기기 관제 탭 신규 추가
+
+> **작성일**: 2026-04-11 23:51 | **완료일**: 2026-04-12 | **상태**: ✅ 완료
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 요청**: 실시간 관제 탭 → 샴 네트워크 관제 탭 옆에 새 서브탭을 추가, 연결된 폰 카메라 화면을 PC GUI에서 실시간 모니터링
+- **레이아웃 결정**: 상단에 연결 폰을 그리드(최대 4개)로 표시, 하나를 클릭하면 하단 대형 뷰로 전환. FPS 배지 포함.
+- **딜레이 영향 여부 확인 (Q&A)**:
+  - ❓ 이 기능이 추가되면 AI 처리 딜레이가 늘어나는가?
+  - ✅ **영향 없음** — 아래 이유로 기존 파이프라인 딜레이에 변화 없음
+    1. AI 처리(`_pipeline.process()`)는 폰 WebSocket에서 이미 실행 중 → 결과를 캐싱만 하는 건 O(1) dict 쓰기
+    2. GUI가 `/clients` HTTP 엔드포인트를 폴링(500ms 주기)하는 건 localhost 내부 통신 → WebSocket 경로와 완전히 분리
+    3. JPEG 프레임 캐싱(~30~50KB × 폰 대수)은 메모리 점유 미미
+    4. **새로운 AI 연산이 전혀 추가되지 않으며** GUI 표시용 읽기 전용 경로만 추가됨
+
+### 🛠️ 구현 계획
+
+#### 수정 파일 1: `connect_phone/server/app.py`
+- `_client_cache: dict[str, dict]` 전역 변수 추가
+  - 키: `cid` (클라이언트 ID)
+  - 값: `{ "last_frame": bytes, "last_result": dict, "fps": float, "connected_at": float }`
+- `ws_endpoint()` 수정: worker가 처리 완료할 때마다 `_client_cache[cid]` 업데이트
+- 신규 HTTP 엔드포인트:
+  - `GET /clients` → 연결된 클라이언트 목록(cid, fps, last_result 요약) 반환
+  - `GET /frame/{cid}` → 해당 클라이언트의 최신 JPEG 바이트 반환
+
+#### 수정 파일 2: `gui/tab_monitor.py`
+- 신규 클래스 `PhoneMonitorSubTab(QWidget)` 추가
+  - 상단 그리드: 최대 4개 폰 썸네일 카드 (`PhoneThumbnailCard`) — 클릭 시 하단 대형 뷰로 전환
+  - 하단 대형 뷰: 선택 폰의 카메라 화면 + PASS/FAIL 상태 배지 + FPS 표시
+  - `QTimer` (500ms): `/clients` 폴링 → 연결/해제 감지 후 그리드 갱신
+  - `QTimer` (200ms): 선택된 폰의 `/frame/{cid}` 폴링 → 대형 뷰 갱신
+- `MonitorTab.__init__()` 수정:
+  ```python
+  sub.addTab(PhoneMonitorSubTab(), "  📱  모바일 기기 관제  ")
+  ```
+
+#### UI 레이아웃 목표
+```
+┌──────────────────────────────────────────────────────────┐
+│ 📱 연결된 기기 (2대)                                      │
+│ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐    │
+│ │폰 #1     │ │폰 #2     │ │          │ │          │    │
+│ │[카메라]  │ │[카메라]  │ │ (빈 슬롯)│ │ (빈 슬롯)│    │
+│ │✅ PASS   │ │❌ FAIL   │ │          │ │          │    │
+│ │3.2 fps   │ │2.8 fps   │ │          │ │          │    │
+│ └──────────┘ └──────────┘ └──────────┘ └──────────┘    │
+├──────────────────────────────────────────────────────────┤
+│ 선택된 기기: 폰 #1  |  ✅ PASS · Target 2  |  3.2 fps   │
+│ ┌──────────────────────────────────────────────────────┐ │
+│ │                                                      │ │
+│ │              (대형 카메라 뷰)                        │ │
+│ │                                                      │ │
+│ └──────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────┘
+```
+
+### ⚠️ 주의사항 (다음 세션에서 작업 시)
+- 서버가 실행 중이 아닐 때 GUI 폴링이 연결 오류를 일으키지 않도록 `try/except` 처리 필수
+- `requests` 대신 `QNetworkAccessManager` 또는 별도 QThread 사용 (메인 스레드 블로킹 방지)
+- 폴링 간격이 너무 짧으면 localhost 오버헤드 발생 → 썸네일 500ms / 대형 뷰 200ms 권장
+
+---
+
+## [2026-04-11 23:23] 🐛 모바일 앱 실시간 연결 중 갑자기 멈추는 버그 2건 수정
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 질문 1**: APK 앱 병렬 연결 가능 여부 확인 → 서버는 `_clients dict` + 클라이언트별 독립 `asyncio.Queue`로 이미 N대 동시 연결 지원 확인
+- **사용자 질문 2**: 실시간 연결 후 갑자기 멈추는 이유 분석
+- **원인 1 (가장 유력)**: `server/app.py`의 `worker` 태스크에서 예외 발생 시 `break`로 종료 → WebSocket 연결은 살아있지만 서버가 결과를 안 보냄 → UI 멈춤처럼 보임
+- **원인 2**: `tab_mobile.py`의 uvicorn 실행 시 `--reload` 옵션 → 개발용 옵션으로 GUI 작동 중 어떤 파일이라도 저장되면 서버 자동 재시작 → WebSocket 연결 끊김
+- **APK 빌드 오류 문서 참조**: `docs/apk_troubleshooting.md` 확인 → 모바일 코드(`useWebSocket.ts`, `CameraScreen.tsx`, `OverlayView`) 및 JSON 응답 구조(`MatchResult` 타입) 무수정 방침 준수
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Fixed** `connect_phone/server/app.py`: `worker()` 예외 처리 `break` → `continue` 변경 (예외 발생 후에도 Worker가 계속 다음 프레임 처리)
+- **Fixed** `gui/tab_mobile.py`: uvicorn 실행 명령에서 `--reload` 플래그 제거 (파일 변경에 의한 서버 자동 재시작 방지)
+
+### 📎 참조 문서
+- `docs/apk_troubleshooting.md` — APK 빌드 시 반복 오류 방지용 체크리스트 (서버 JSON 응답 필드 변경 시 클라이언트 코드 동기화 필요)
+
+---
+
+## [2026-04-11 22:42] 🚀 깃허브 이식성 확인 + README/requirements.txt 최초 생성
+
+### 💬 논의 및 결정 사항 (Discussion)
+- **사용자 질문**: "현재 폴더 내 경로가 다 상대경로로 지정되어 있어서 깃허브에 올라갔을 때 세팅만 하고 바로 사용할 수 있냐?"
+- **분석 결과**: 전체 소스코드(`.py`, `.bat`)는 이미 `os.path.abspath(__file__)`, `%~dp0` 등 위치 독립적 패턴을 사용하고 있어 깃허브 클론 후 즉시 동작 가능.
+- **문제 파일**: `models/canon_fast_yolo/args.yaml` (YOLO 자동 생성 로그), 각종 진단 결과 `.txt` 파일에만 절대경로 기록이 있으나, 이는 실행 결과물이므로 코드 동작에 무관.
+- **결정**: `requirements.txt`와 `README.md`가 없어 클론한 사람이 어떤 패키지를 설치해야 하는지 알 수 없는 문제를 해결하기 위해 두 파일 신규 생성.
+
+### 🛠️ 코드 수정 내역 (Code Changes)
+- **Added**: `requirements.txt` — 프로젝트 전체 Python 의존성 목록 (PyQt5, opencv-python, torch, torchvision, ultralytics, google-generativeai, python-dotenv, matplotlib, PyYAML, pytesseract)
+- **Added**: `README.md` — 깃허브 공개용 프로젝트 소개 문서 (5분 설치 가이드, 시스템 요구사항, 프로젝트 구조, 아키텍처 다이어그램, FAQ 포함)
+
+---
+
+## [2026-04-11] 폴리곤 점 드래그 편집 — 학습 데이터 뷰어 + 세그멘테이션 라벨링
+
+> **상태**: ✅ 완료
+
+### 💬 주요 논의 및 결정
+
+- **요청**: 야간학습 지시 탭의 학습데이터 뷰어와 세그멘테이션 라벨링 탭에서 YOLO 폴리곤 점을 마우스로 드래그해서 위치 수정 가능하도록 추가
+- **드래그 우선순위 설계**: 폴리곤 점 감지 → seg 모드 클릭 → ROI 드래그 순으로 처리하여 기존 기능과 충돌 없음
+- **호버 커서**: 폴리곤 점 근처에 마우스를 올리면 `SizeAllCursor` (이동 화살표)로 변경해 드래그 가능한 점임을 즉시 인식 가능
+- **점 크기 확대**: 드래그 클릭 정확도 향상을 위해 점 원 크기 증가
+
+---
+
+### ✨ 신규 기능 1: `DatasetImageViewer` 폴리곤 점 드래그 (`gui/tab_training.py`)
+
+#### 추가된 클래스 멤버 (이전 세션에서 적용 완료)
+
+| 항목 | 내용 |
+|------|------|
+| `polygon_edited = pyqtSignal()` | 점 드래그 이동 완료 시 발행 |
+| `_DRAG_RADIUS = 12` | 드래그 감지 반경(픽셀) |
+| `_drag_poly_idx`, `_drag_pt_idx` | 드래그 중인 폴리곤/점 인덱스 |
+| `setMouseTracking(True)` | 호버 커서 변경용 |
+| `_img_transform()` | 이미지 표시 오프셋·스케일 반환 유틸 |
+| `_find_nearest_polygon_point(cx, cy)` | 반경 내 가장 가까운 점 인덱스 탐색 |
+
+#### 변경된 이벤트 핸들러
+
+**`mousePressEvent`**
+- 좌클릭 시 `_find_nearest_polygon_point()` 먼저 실행
+- 반경 내 점이 있으면 `_drag_poly_idx / _drag_pt_idx` 설정 후 즉시 return (seg 모드·ROI 로직 건너뜀)
+
+**`mouseMoveEvent`**
+- 드래그 중: 마우스 좌표를 정규화([0,1] 클리핑)해 `_polygons[pi][qi]` 실시간 업데이트 → `update()`
+- 비드래그: 근처 점 유무에 따라 `SizeAllCursor` ↔ `ArrowCursor` 전환
+- 기존 ROI 고무줄 로직은 드래그 중이 아닐 때만 동작
+
+**`mouseReleaseEvent`**
+- 드래그 중이었으면 인덱스 초기화 후 `polygon_edited` 시그널 발행 → return
+- 기존 ROI 처리는 드래그가 없었을 때만 동작
+
+#### 점 크기
+
+```python
+# 기존
+p.drawEllipse(int(ox + nx*sw) - 3, int(oy + ny*sh) - 3, 6, 6)
+# 변경 (12px 지름)
+p.drawEllipse(int(ox + nx*sw) - 6, int(oy + ny*sh) - 6, 12, 12)
+```
+
+#### `DatasetViewerTab` 연결
+
+```python
+self.viewer.polygon_edited.connect(self._on_polygon_edited)
+```
+
+```python
+def _on_polygon_edited(self):
+    """폴리곤 점 드래그 이동 완료 시 seg_list 동기화"""
+    self.seg_list.clear()
+    for i, poly in enumerate(self.viewer._polygons):
+        self.seg_list.addItem(f"다각형-{i+1}: {len(poly)} points")
+```
+
+---
+
+### ✨ 신규 기능 2: `PolyCanvas` 폴리곤 점 드래그 (`gui/tab_seg_labeling.py`)
+
+#### 추가된 클래스 멤버
+
+| 항목 | 내용 |
+|------|------|
+| `setMouseTracking(True)` | 호버 커서 변경용 |
+| `_drag_idx = None` | 드래그 중인 점 인덱스 |
+| `_find_nearest_point(cx, cy, radius=12)` | 반경 내 가장 가까운 점 인덱스 탐색 |
+
+#### 변경된 `mousePressEvent`
+
+```python
+# 기존: 항상 새 점 추가
+# 변경: 근처 점이 있으면 드래그 시작, 없으면 새 점 추가
+idx = self._find_nearest_point(event.x(), event.y())
+if idx is not None:
+    self._drag_idx = idx   # 드래그 모드 진입
+else:
+    norm = self._to_norm(event.x(), event.y())
+    if norm:
+        self._points.append(norm)   # 기존 동작
+```
+
+#### 신규 `mouseMoveEvent`
+
+```python
+if self._drag_idx is not None:
+    norm = self._to_norm(event.x(), event.y())
+    if norm:
+        self._points[self._drag_idx] = norm
+        self._repaint()
+    return
+# 호버 커서
+idx = self._find_nearest_point(event.x(), event.y())
+self.setCursor(Qt.SizeAllCursor if idx is not None else Qt.CrossCursor)
+```
+
+#### 신규 `mouseReleaseEvent`
+
+```python
+if event.button() == Qt.LeftButton and self._drag_idx is not None:
+    self._drag_idx = None
+    self._repaint()
+```
+
+#### 점 크기
+
+```python
+# 기존: radius 6
+cv2.circle(vis, tuple(p), 6, dot_c, -1)
+# 변경: radius 8
+cv2.circle(vis, tuple(p), 8, dot_c, -1)
+```
+
+---
+
+### 🗂 변경 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `gui/tab_training.py` | `DatasetImageViewer` 드래그 시그널·헬퍼·이벤트 핸들러, 점 12px, `DatasetViewerTab._on_polygon_edited()` |
+| `gui/tab_seg_labeling.py` | `PolyCanvas` 드래그 상태·헬퍼·이벤트 핸들러, 점 8px |
+
+---
+
+## [2026-04-11] 전처리 감도 분석 — 패럴렐 색상 매칭 + 판별력 기준 재설정 + 점수 오염 버그 수정
+
+> **상태**: ✅ 완료
+
+### 💬 주요 논의 및 결정
+
+- **패럴렐 코디네이트 색상 불일치**: 테이블은 순위 기반 녹색 알파인데 그래프는 RdYlGn score 기반 빨강-녹색이어서 어느 테이블 행이 어느 라인인지 알 수 없었음 → 동일한 팔레트로 통일 + 라인 끝에 #순위 번호 추가
+- **판별력 임계값 % 의미 불명확**: 판별력이 점수 단위인데 % 임계값이 어떤 실제 점수에 해당하는지 UI에 표시가 없었음 → 역산 공식으로 실제 disc_score 값을 힌트로 표시
+- **판별력 기준값 재설정 요청**: 기존 `/50` 기준(100% = +50점)이 너무 낮음 → `/100` 기준(100% = +100점)으로 변경
+- **`_update_results_table` 점수 오염 버그**: 우선순위 재계산 시 `r['score']` 를 직접 덮어써서 `_opt_records` 원본이 오염됨 → 다음 dedup 비교가 우선순위 변경 전 값으로 동작하는 버그
+- **`_on_top10_row_clicked` 우선순위 무시 버그**: 행 클릭 시 top10 재구성이 `r['score']` (thread 기본값) 기준으로 정렬되어 현재 우선순위 설정이 반영되지 않아 테이블 순서와 불일치
+
+---
+
+### 🔧 수정 1: 패럴렐 코디네이트 색상 테이블과 통일
+
+#### 변경 내용
+- `RdYlGn` colormap + score-based `Normalize` 완전 제거
+- `_rank_rgba(rank, n)` 함수 추가: 테이블과 **동일한** `#27AE60` 녹색 + 순위 기반 알파
+  - rank 0 (1위): alpha ≈ 0.78 (진녹)
+  - rank 9 (10위): alpha ≈ 0.20 (연녹)
+- 라인 오른쪽 끝에 `#1` ~ `#10` **순위 번호 텍스트** 추가 → 테이블 행과 한눈에 매칭
+- 범례: cmap 기반 범례 → `_rank_rgba(0)` 기반 "#1위(진녹) → #10위(연녹)" 설명으로 교체
+
+---
+
+### 🔧 수정 2: 판별력 임계값 힌트 — 실제 점수 단위 역산 표시
+
+`_on_priority_change()` 에서 1순위 선택에 따라 힌트 라벨 내용 변경:
+
+| 1순위 | 임계값 X% | 힌트 표시 내용 |
+|-------|-----------|--------------|
+| 통과율 | 90% | `통과율 90% 이상이면 판별력 우선` |
+| 판별력 | 70% | `판별력 +40점 이상이면 속도 우선  (70% = disc_score +40  \| 50%=0점 기준)` |
+| 속도 | 80% | `속도 20ms 이하이면 통과율 우선  (80% = avg_ms 20ms  \| 100%=0ms 기준)` |
+| 모두 | 100% | `100%면 항상 1순위 우선 (임계값 비활성)` |
+
+---
+
+### 🔧 수정 3: 판별력 정규화 기준 50 → 100
+
+#### `_normalize_metric("disc_score", value)` 변경
+
+```
+기존: disc_norm = clip(disc / 50,  -1, 1) × 0.5 + 0.5
+변경: disc_norm = clip(disc / 100, -1, 1) × 0.5 + 0.5
+```
+
+| 임계값 % | 해당 disc_score |
+|---------|----------------|
+| 0% | ≤ -100점 |
+| 25% | -50점 |
+| 50% | 0점 (기준점) |
+| 60% | +20점 |
+| 75% | +50점 |
+| 90% | +80점 |
+| 100% | ≥ +100점 (임계값 비활성) |
+
+힌트 역산 공식도 수정:
+```
+기존: disc_equiv = val - 50          (÷50 기준)
+변경: disc_equiv = (val - 50) × 2    (÷100 기준)
+```
+
+---
+
+### 🐛 수정 4: `_update_results_table` 점수 오염 버그
+
+#### 원인
+
+```python
+# 버그: r은 _opt_records 내부 dict의 참조 → 덮어쓰면 원본 오염
+for r in seen.values():
+    r['score'] = _compute_priority_score(...)   # ← 원본 변경!
+```
+
+우선순위 설정이 바뀔 때마다 `_opt_records` 내 `score` 값이 덮어써져서, 다음 dedup 비교(`r['score'] > seen[key]['score']`)가 오염된 값으로 동작했음.
+
+#### 수정
+
+```python
+# 원본을 건드리지 않고 정렬 키만 람다로 계산
+def _pri_score(r):
+    return _compute_priority_score(
+        r.get('disc_score', 0.0), r.get('pass_rate', 0.0),
+        r.get('avg_ms', 0.0), p1_key, thresh_pct, p2_key)
+
+top10 = sorted(seen.values(), key=_pri_score, reverse=True)[:10]
+```
+
+---
+
+### 🐛 수정 5: `_on_top10_row_clicked` 우선순위 미적용 버그
+
+#### 원인
+
+행 클릭 시 top10 재구성이 `r['score']` (thread 계산 기본값 또는 오염된 값) 기준으로 정렬되어 현재 UI의 우선순위 설정이 반영되지 않아 테이블 행 순서와 불일치.
+
+#### 수정
+
+```python
+p1_key, thresh_pct, p2_key = self._get_priority_settings()
+top10 = sorted(
+    seen.values(),
+    key=lambda r: _compute_priority_score(
+        r.get('disc_score', 0.0), r.get('pass_rate', 0.0),
+        r.get('avg_ms', 0.0), p1_key, thresh_pct, p2_key),
+    reverse=True
+)[:10]
+```
+
+→ 테이블과 `_on_top10_row_clicked` 가 항상 동일한 순위 기준으로 top10을 구성함.
+
+---
+
+### 🗂 변경 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `gui/tab_param_viz.py` | `_rank_rgba()`, `_normalize_metric` disc /100, `_on_priority_change` 힌트 역산, `_update_results_table` 오염 방지, `_on_top10_row_clicked` 우선순위 적용 |
+
+---
+
+## [2026-04-11] 전처리 감도 분석 — 순위 기준 설정 + 중복 제거 + 색깔 오류 수정
+
+> **상태**: ✅ 완료
+
+### 💬 주요 논의 및 결정
+
+- **순위 기준 고정 문제**: 기존 `score = pass_rate × 10000 + disc_score` 공식이 하드코딩되어 통과율이 무조건 1순위였음 → 사용자 설정으로 변경
+- **임계값 개념 도입**: "1순위가 X% 이상이면 2순위로 세부 결정" — 임계값 초과 시 1순위 점수를 cap 하여 2순위가 순위를 결정하는 방식 채택
+- **중복 연산 문제**: 동일 파라미터 조합이 LHS 샘플링 / Optuna 탐색 과정에서 재등장할 때 불필요한 재계산이 발생했음 → 파라미터 조합 캐시 도입
+- **Top 10 중복 표시**: 같은 파라미터 조합이 avg_ms(타이밍 노이즈)만 달리해서 복수 등장하던 현상 → Thread 레벨 덮어쓰기로 근본 차단
+- **색깔 오류 반복**: `matplotlib.cm.RdYlGn` + `Normalize` 조합이 경계 조건(모든 통과율 동일 등)에서 오류 발생 → 순위 기반 고정 녹색 알파값으로 대체
+
+---
+
+### ✨ 신규 기능: 순위 기준 설정 UI (`tab_param_viz.py`)
+
+오른쪽 컨트롤 패널에 **"순위 기준 설정"** 섹션 추가.
+
+| 컨트롤 | 설명 |
+|--------|------|
+| 1순위 콤보박스 | 통과율 / 판별력 / 속도 중 선택 |
+| 1순위 임계값 SpinBox | 0-100% — 이 값 이상이면 2순위로 세부 결정 (100% = 임계값 비활성, 항상 1순위 우선) |
+| 2순위 콤보박스 | 통과율 / 판별력 / 속도 중 선택 |
+| 실시간 힌트 라벨 | 설정 변경 시 "통과율 90% 이상이면 판별력 우선" 형태로 즉시 표시 |
+
+#### 점수 공식 (`_compute_priority_score`)
+
+```
+p1_normalized = normalize(1순위 지표)   # 0~1, 높을수록 좋음
+p2_normalized = normalize(2순위 지표)
+p1_effective  = min(p1_normalized, threshold/100)   # 임계값으로 cap
+score = p1_effective × 10000 + p2_normalized
+```
+
+- 정규화 기준: pass_rate(0-1 그대로), disc_score(/50 후 ±1 클리핑 → 0-1), avg_ms(1-ms/100, 빠를수록 높음)
+- 임계값 초과 레코드끼리는 p1이 동점 → p2가 순위를 결정
+
+#### 적용 범위
+
+- `FullOptThread._emit_trial()` — 수렴 추적용 best_score
+- `FullOptThread._run_optuna()` — Optuna objective 반환값
+- `_update_results_table()` — 이미 수집된 레코드 재계산 후 정렬 (설정 변경 즉시 반영)
+- 분석 시작 시 현재 UI 설정을 Thread에 전달 (`priority1`, `threshold_pct`, `priority2`)
+
+---
+
+### 🔧 수정: 중복 연산 제거 및 덮어쓰기
+
+#### `FullOptThread` — 파라미터 조합 캐시
+
+- `_param_cache: dict` 추가 (`tuple(params)` → `(disc, pass_rate, avg_ms)`)
+- `_run_lhs()`: 같은 조합 재등장 시 `_eval_params` 호출 없이 캐시에서 즉시 반환, 프로그레스 카운트는 정상 유지
+- `_run_optuna()` objective: 동일 조합 재등장 시 캐시 반환 (Optuna가 수렴 과정에서 이미 본 조합을 재시도할 때 연산 없이 통과)
+
+#### `FullOptThread._emit_trial()` — 중복 레코드 덮어쓰기
+
+- `_records_idx: dict` 추가 (`tuple(params)` → `_records` 리스트 인덱스)
+- 같은 파라미터 조합의 trial이 다시 emit될 경우 `_records` 에 append 대신 해당 인덱스를 **덮어쓰기** → finished/stopped 시 전달되는 records에 중복 없음
+
+---
+
+### 🐛 수정: 색깔 오류
+
+#### `_update_results_table()` — colormap 완전 제거
+
+- 기존: `matplotlib.cm.RdYlGn` + `Normalize(vmin, vmax)` → 모든 통과율이 동일하거나 경계 조건에서 색상 오류 발생
+- 변경: **순위 기반 고정 녹색 알파값** (`#27AE60`, alpha 200→50)
+  - 1위: alpha 200 (진녹색)
+  - 마지막 순위: alpha ~50 (연녹색)
+  - colormap·Normalize 코드 완전 삭제
+
+#### 패럴렐 코디네이트 그래프 — colormap API 수정
+
+- `matplotlib.cm.RdYlGn` (deprecated) → `matplotlib.colormaps['RdYlGn']` (구버전 폴백 포함)
+- `Normalize` 범위 `vmin == vmax` 엣지케이스 수정: `vmax = vmin + 1.0` 보정
+
+---
+
+### 📊 알고리즘 동작 정리 (Q&A)
+
+**Q: N번 연산할 때 최적화를 하는 건가요, 랜덤하게 돌리는 건가요?**
+
+- **optuna 없을 때 (LHS)**: 완전 랜덤이 아닌 Latin Hypercube Sampling. 각 파라미터 값 범위를 N등분해 격자 안에 한 번씩 강제 배치 → 순수 랜덤보다 공간 커버리지 훨씬 좋음. 단, 좋은 영역을 집중 탐색하지는 않음.
+- **optuna 있을 때 (TPE)**: 진짜 최적화. 초반 수십 회는 LHS식으로 탐색, 이후 고득점 구역에 확률 모델 구성 → 그 주변에 더 많이 시도. 시도 횟수가 쌓일수록 좋은 영역으로 수렴.
+
+---
+
+### 🗂 변경 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `gui/tab_param_viz.py` | 순위 설정 UI, `_compute_priority_score()`, `_normalize_metric()`, `FullOptThread` 캐시/덮어쓰기, colormap 제거 |
+
+---
+
+## [📋 할 일 → ✅ 완료] 가중치 UI 개선 + ORB 속도 그래프 시각화
+
+> **작성일**: 2026-04-11 | **상태**: ✅ 완료 — 2026-04-11
+
+### 🐛 수정: 속도/정확도 가중치 SpinBox 합계 10 강제 고정 ✅
+
+- `spin_spd_viz.valueChanged` → `spin_acc_viz = 10 - v` (`blockSignals`로 재귀 방지)
+- `tab_training.py`도 동일하게 lambda 연동
+- 속도=6 설정 시 정확도 자동 4, 항상 합계 10 유지
+
+### ✨ 완료: 패럴렐 코디네이트에 판별력·속도 축 추가 ✅
+
+- `_draw_parallel_coords()`: 전처리 파라미터 7개 축 뒤에 `판별력`·`속도(ms)` 2개 축 추가 (총 9개)
+  - 판별력 축: `[-30, +30]` 정규화, 파란 계열 축선
+  - 속도 축: `[40ms=느림, 8ms=빠름]` 역정규화, 녹색 계열 축선
+- 수렴 곡선 y축 라벨: "판별력 점수" → "합성점수 (판별력+속도)"
+- 레전드에 판별력·속도 축 설명 추가
+
+---
+
+## [2026-04-11] ORB 파이프라인 일관성 확보 + 최적화 탭 전면 개선
+
+> **상태**: ✅ 완료
+
+### 💬 주요 논의 및 결정
+
+- **판별력 vs ORB 점수 혼용 문제**: 판별력(correct − best_wrong)은 주 지표, ORB 점수는 참고용으로 병행 표시하도록 확정
+- **전처리 불일치 근본 원인 파악**: `engine/matcher.py`의 `load_targets_from_dir()`이 타겟 로드 시 `ImagePreprocessor()` 기본값을 사용해 실시간 프레임과 파라미터가 달랐음 → `preprocessor=` 주입으로 수정
+- **auto_tuner 파이프라인 불일치**: 구버전 auto_tuner가 top-hat/Laplacian 등 실시간에 없는 전처리를 사용 → 전면 재작성
+- **전처리 감도 분석 탭 UI 5개 버그 수정**: 비타겟 주황색 오류, [제외] 텍스트 오류, 컬럼 누락, 패럴렐 텍스트 겹침, 수렴 후 색상 단색화
+- **타겟 병렬 비교 상대성 로직 버그**: `as_completed` 비결정적 순서로 인해 합격한 타겟이 불합격 고득점 타겟에 덮어쓰이는 버그 발견 및 수정
+- **속도/정확도 가중치**: 실시간 처리속도와 판별력을 각각 정규화 후 가중합산하는 합성점수 도입, 전처리 감도 분석 탭 + 학습 탭 모두에 적용
+- **Top-N 선택 적용**: 1위 자동 저장 대신 top-10 결과를 표로 보여주고 사용자가 선택
+
+---
+
+### 🔧 파일별 변경 내역
+
+#### `engine/matcher.py`
+- `load_targets_from_dir()` 시그니처에 `preprocessor=None` 파라미터 추가
+- 외부에서 주입된 preprocessor 우선 사용; 미전달 시 기본값 생성 + 경고 출력
+- 타겟 이미지와 실시간 프레임이 동일한 전처리 파라미터를 사용함을 보장
+
+#### `gui/tab_monitor.py`
+- `load_targets_from_dir()` 호출 3곳에 `preprocessor=self.preprocessor` 추가 (초기 로드, `_apply_reload_params`, `reload_targets`)
+- **타겟 병렬 비교 로직 수정**: `as_completed` 스트리밍 방식 → 전체 수집 후 2단계 선택
+  - 1단계: `tok=True`(합격)인 타겟 중 최고 점수 선택
+  - 2단계: 합격자 없으면 전체 중 최고 점수(불합격 표시)
+  - 기존 버그: 합격 타겟(30점)이 고득점 불합격 타겟(50점)에 의해 덮어쓰이는 경우 발생
+
+#### `gui/tab_param_viz.py` — DetailEvalThread / _on_detail_finished
+- `DetailEvalThread._run()`: `"scores": dict(sc)` 필드 추가 (타겟별 개별 ORB 점수)
+- `_on_detail_finished()`: 컬럼 동적 생성 — `이미지 | 판별력 | 정답 매칭 | 최고 오답 | [타겟ID별] | 라벨`
+  - 비타겟 행 배경: best_wrong≥50=빨강, ≥30=노랑, <30=회색
+  - 주황 셀: `is_target=True` 행에만 적용 (비타겟 행에 주황 제거)
+  - [제외] 텍스트 제거 (비타겟도 페널티 지표로 활용해야 하므로)
+  - 비타겟 판별력 툴팁: "비타겟 패널티 = 0 − 최고 오탐 매칭"
+- `_draw_parallel_coords()`: 축 라벨별 점수 텍스트 제거 (겹쳐서 가독성 저하), top-10 내 상대 범위로 색상 정규화
+
+#### `gui/tab_param_viz.py` — FullOptThread (속도/정확도 가중치)
+- `__init__`: `speed_weight=5`, `accuracy_weight=5` 파라미터 추가
+- `_composite(disc_score, avg_ms)`: 판별력 `[-30,+30]`, 속도 `[8ms,40ms]` 정규화 후 가중합
+- `_emit_trial()`: records에 `disc_score`, `avg_ms` 저장
+- `_run_lhs()` / `_run_optuna()`: 실측 타이밍 측정 → 합성점수로 최적화 (optuna도 합성점수 기준)
+
+#### `gui/tab_param_viz.py` — ParamSensitivityTab UI
+- "분석 시작" 버튼 위에 `속도: [5] / 정확도: [5]` SpinBox 추가 ("최적화 우선순위" 섹션)
+- top-10 테이블 컬럼 변경: `순위 | 합성점수 | 판별력 | 속도(ms) | 파라미터들`
+- 적용 버튼: "최적 파라미터 적용 저장" → "선택한 파라미터 적용 저장"
+  - 행 선택 시 해당 순위 파라미터 적용, 미선택 시 1위 자동 적용
+  - 저장 확인 메시지에 합성점수/판별력/속도 함께 표시
+
+#### `gui/tab_training.py` — OrbTunerThread
+- `finished` 시그널: `(dict, float)` → `(list, float)` (top-10 결과 리스트)
+- `__init__`: `speed_weight=5`, `accuracy_weight=5` 추가
+- `run()`: 자동 저장 제거 → top-10 결과 emit, 사용자 선택 후 저장
+- `OrbResultDialog` 클래스 추가: 순위/합성점수/판별력/속도/파라미터 표 + 선택 적용
+- ORB 버튼 위에 `속도: [5] / 정확도: [5]` SpinBox 추가
+- `_fire_orb()`: 가중치를 읽어 OrbTunerThread에 전달
+- `_on_orb_done()`: OrbResultDialog 표시 → 사용자 선택 순위 저장
+
+#### `offline/auto_tuner.py` — 전면 재작성
+- **구버전 문제**: top-hat transform, Laplacian sharpening, min-max normalize 등 실시간에 없는 전처리 사용
+- **신버전 전처리**: 실시간 파이프라인과 동일한 `blur → gamma → CLAHE → sharpening`
+- 탐색 공간 키: `params_config.json`과 1:1 대응 (`clahe_clip_limit`, `clahe_tile_grid`, `blur_ksize`, `gamma`, `sharpen_amount`, `nfeatures`, `lowe_ratio`)
+- `__init__`: `speed_weight`, `accuracy_weight` 파라미터 추가
+- `_score()`: 처리시간 실측 → `(disc_score, avg_ms)` 반환
+- `objective()`: 합성점수 계산 + `trial.set_user_attr('disc_score', ...)`, `trial.set_user_attr('avg_ms', ...)`
+- `run_night_tuning(top_n=10)`: top-N 결과 리스트 반환 (자동 저장 없음)
+- `save_best_params()`: 기존 config 키 유지 후 덮어씀
+
+---
+
+### 📐 합성점수 정규화 기준 (공통)
+
+| 지표 | 하한(0점) | 상한(1점) | 비고 |
+|------|---------|---------|------|
+| 판별력 (disc_score) | −30 | +30 | correct − best_wrong |
+| 처리속도 (avg_ms) | 40ms(느림=0) | 8ms(빠름=1) | 전처리+ORB 추출 시간/이미지 |
+
+`합성점수 = (accuracy_weight/total) × disc_norm + (speed_weight/total) × speed_norm`
+
+---
+
+## [📋 계획 — 다음 세션] 전처리 감도 분석 추가 개선 (tab_param_viz.py)
+
+> **작성일**: 2026-04-10 | **상태**: ✅ 완료 — 2026-04-11
+
+### 🐛 해결할 버그
+
+#### 1. 우측 컨트롤 패널 가로 잘림
+- **증상**: 우측 300px 패널에서 긴 텍스트 라벨(공간 안내, 진행 상황 등)이 잘려 보임
+- **원인**: `QScrollArea` 내부 위젯 최소 너비가 지정되지 않아 내용이 클리핑됨
+- **수정 계획**:
+  - `right_w.setMinimumWidth(280)` 추가
+  - `QScrollArea.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)`로 변경 (필요 시 가로 스크롤 허용)
+  - 긴 레이블은 `setWordWrap(True)` + `setMaximumWidth(270)` 강제 줄바꿈
+  - `lbl_space` 텍스트를 두 줄로 분리: "공간: N개" / "알고리즘: LHS / TPE"
+
+#### 2. 시각화 UI 글자 겹침
+- **증상**: matplotlib 캔버스 내 텍스트(축 라벨, 제목, 눈금 값)가 서로 겹침
+- **원인**: `figsize=(12,7)` 고정 + 패널 분리 후 실제 캔버스 폭이 줄었으나 폰트 크기·여백은 그대로
+- **수정 계획**:
+  - `tight_layout(pad=1.5)` 또는 `fig.subplots_adjust(...)` 적용
+  - `_draw_1d_results`: `inner hspace=0.80` → `1.0`, 각 서브플롯 `xlabel` fontsize 7→6
+  - `_draw_opt_figure`: `top=0.93, bottom=0.09, left=0.07` 여백 조정
+  - `_draw_parallel_coords`: x축 라벨 `fontsize=9` → `8`, `rotation=10` 추가
+
+### ✨ 신규 기능: 파라미터 조합별 이미지 ORB 상세 점수 뷰
+
+#### 요구사항
+- 상위 10개 파라미터 조합 표(좌측 하단 `tbl_top10`)의 행을 클릭하면
+- **우측 패널 하단 빈 공간**에 해당 파라미터 조합으로 전체 테스트 이미지를 재평가한
+  이미지별 ORB 점수 표를 표시
+- 어느 이미지가 해당 조합에서 잘 맞는지/틀리는지 한눈에 파악 목적
+
+#### 구현 계획
+
+**① `tbl_top10` 클릭 이벤트 연결**
+```python
+self.tbl_top10.cellClicked.connect(self._on_top10_row_clicked)
+```
+
+**② 우측 패널 하단에 ORB 상세 표 추가**
+- 기존 `rv.addStretch()` 위에 섹션 추가:
+```
+─ 선택 조합 이미지별 ORB 점수 ─
+[정렬 기준: 판별력▼ | 이미지명 | 정답점수 | 최고오답]
+QTableWidget: 이미지명 / 판별력 / 정답타겟 매칭 / 최고오답 매칭 / 라벨
+```
+- 컬럼: `이미지` / `판별력` / `정답 매칭` / `최고 오답` / `라벨`
+- 정렬: 헤더 클릭으로 오름/내림차순 (`QHeaderView.setSortIndicatorShown`)
+- 판별력 < 0인 행은 빨간 배경, ≥ 0인 행은 흰 배경
+
+**③ `_on_top10_row_clicked(row, col)` 메서드 신설**
+```python
+def _on_top10_row_clicked(self, row, col):
+    # 1. top10에서 해당 params 추출
+    top10 = sorted(self._opt_records, key=..., reverse=True)[:10]
+    params = top10[row]['params']
+    # 2. 백그라운드 QThread로 재평가 (UI 블로킹 방지)
+    self._detail_thread = DetailEvalThread(params, self._path_items, TARGET_DIR)
+    self._detail_thread.finished.connect(self._on_detail_finished)
+    self._detail_thread.start()
+    # 3. 표 헤더에 현재 조합 순위 표시
+    self.lbl_detail_title.setText(f"#{row+1} 조합 이미지별 ORB 점수")
+```
+
+**④ `DetailEvalThread(QThread)` 클래스 신설**
+- 입력: `params`, `path_items`, `target_dir`
+- 동작: 각 테스트 이미지에 대해 `_orb_scores()` 실행, 판별력 계산
+- 시그널: `finished = pyqtSignal(list)` — `[{img_name, label, disc, correct, best_wrong}, ...]`
+
+**⑤ `_on_detail_finished(detail_rows)` 메서드**
+- `tbl_detail` 업데이트
+- 판별력 기준 내림차순 기본 정렬
+- 판별력 < 0 행은 `QColor("#FADBD8")` 배경
+
+#### 예상 UI 레이아웃 (우측 패널)
+```
+[ 분석 시작 ]  [ 중지 ]
+─ 진행 상황 ─────────────
+  progress bar
+  시도 100/300 (33%)
+  현재 최고: 12.34
+
+─ 최적 파라미터 적용 ─────
+[ 💾 최적 파라미터 적용 저장 ]
+
+─ 선택 조합 이미지별 점수 ──
+#3 조합 이미지별 ORB 점수
+┌────────┬──────┬──────┬──────┬──────┐
+│이미지   │판별력 │정답  │오답  │라벨  │
+├────────┼──────┼──────┼──────┼──────┤
+│img_001 │ 18.0 │  45  │  27  │ A    │
+│img_003 │ -2.0 │  10  │  12  │ B    │← 빨간 배경
+└────────┴──────┴──────┴──────┴──────┘
+```
+
+### 📁 수정 대상 파일
+- `gui/tab_param_viz.py` — 위 모든 변경 사항
+
+---
+
+## [2026-04-11 B] 🔗 YOLO 실시간 연동 + 패럴렐 글자 깨짐 수정 + 색상 동기화 + 저장 즉시 반영 (tab_param_viz.py, main_window.py)
+
+> **작성일**: 2026-04-11
+
+### 💬 논의 및 결정 사항
+
+- **YOLO 모델 불일치**: `tab_param_viz`가 `data/yolo/yolov8n-seg.pt`(범용 모델)를 사용하고 있었음. 실시간 관제는 `models/canon_fast_yolo/weights/best.pt`(커스텀 학습 모델)를 사용 — 두 경로가 달라 분석 결과가 실제 운영 조건과 달라질 수 있음.
+- **패럴렐 코디네이트 왼쪽 깨진 글자**: `ax.text(-0.3, ...)` 순위 텍스트가 `tight_layout(rect=[0, ...])` 경계 밖으로 밀려나 잘리고 깨져 표시됨.
+- **tbl_top10 색상**: 패럴렐 코디네이트는 RdYlGn 컬러맵으로 순위를 색으로 표현하지만, 옆 표(`tbl_top10`)는 1위만 초록·2~3위만 파랑으로 고정되어 시각적 연결이 없었음.
+- **저장 버튼 → 실시간 즉시 반영 안 됨**: "최적 파라미터 적용 저장" 버튼이 `data/params_config.json`에 쓰기만 하고 `VideoThread.reload_params()`를 트리거하지 않아, 실시간 관제가 실행 중이어도 재시작 전까지 반영 안 됨.
+
+### 🛠️ 코드 수정 내역
+
+**`gui/tab_param_viz.py`**
+
+- **YOLO 모델 경로 우선순위 변경**:
+  - 기존: `YOLO_MODEL = data/yolo/yolov8n-seg.pt` (고정)
+  - 변경: `_YOLO_REALTIME = models/canon_fast_yolo/weights/best.pt` 우선 탐색, 없으면 `_YOLO_FALLBACK = data/yolo/yolov8n-seg.pt`로 폴백
+  - 실시간 모니터(`tab_monitor.py`)와 동일한 모델로 분석 가능
+
+- **패럴렐 코디네이트 순위 텍스트 이전**:
+  - 기존: `ax.text(-0.3, y_vals[0], f"#{rank+1}", ha='right', ...)` — figure 왼쪽 경계 밖으로 나가 깨짐
+  - 변경: 왼쪽 텍스트 완전 제거, 오른쪽에 `f"#{rank+1}  {score:.1f}"` 로 순위+점수 통합 표시
+  - `clip_on=False` 추가: axes 경계를 넘어도 텍스트 잘림 없음
+  - `xlim`을 `(-0.3, len(PARAM_KEYS) + 0.6)`으로 조정해 오른쪽 여유 공간 확보
+
+- **tbl_top10 행 배경색 RdYlGn 동기화**:
+  - 기존: 1위 초록 고정, 2~3위 파랑 고정 (`__import__` 임시 방식)
+  - 변경: 패럴렐 코디네이트와 동일한 `matplotlib.cm.RdYlGn` + `Normalize(vmin, vmax)` 계산
+  - 1~10위 모든 행에 점수 기반 색상(알파 160, 반투명) 적용 → 차트와 표가 색상 일치
+  - `QColor`를 최상단 임포트로 이동 (`from PyQt5.QtGui import ... QColor`)
+
+- **`params_saved` 시그널 추가**:
+  - `ParamSensitivityTab`에 `params_saved = pyqtSignal()` 선언
+  - `_apply_best_params()` 저장 완료 시 `self.params_saved.emit()` 호출
+  - 저장 완료 메시지에 "실시간 관제가 실행 중이면 다음 프레임부터 즉시 반영됩니다" 문구 추가
+
+**`gui/main_window.py`**
+
+- `TuningTab.__init__`: `sensitivity_tab.params_saved.connect(self.params_saved)` 연결 추가
+  - 기존: GuideTab 저장 시에만 `VideoThread.reload_params()` 트리거
+  - 변경: ParamSensitivityTab 저장 시에도 동일하게 즉시 반영
+
+### 📁 수정 대상 파일
+- `gui/tab_param_viz.py`
+- `gui/main_window.py`
+
+---
+
+## [2026-04-11 A] 🧩 ORB 상세 뷰 완성 + 판별력 공식 개편 + YOLO 다각형 원근 보정 + UI 글자 겹침 전면 수정 (tab_param_viz.py)
+
+> **작성일**: 2026-04-11
+
+### 💬 논의 및 결정 사항
+
+- **중복 순위 문제**: LHS/optuna가 동일 파라미터 조합을 여러 번 시도 → tbl_top10에 같은 조합이 여러 순위로 중복 등장. dedup 처리 필요.
+- **창 축소 시 글자 겹침**: 레이아웃은 수정됐지만 창을 줄이면 샤프닝 강도·감마 등 x축 라벨이 여전히 겹침. `tight_layout`의 `rect` 파라미터로 여백 확보.
+- **x축 라벨 잘림**: `rect=[0, 0.0, ...]`이었던 bottom=0 설정이 x축 라벨 공간을 0으로 만듦. `rect=[0, 0.10, 1, 0.96]` + `canvas.setMinimumWidth(600)`으로 해결.
+- **줌 기능 필요**: 그래프 확대/축소 요청 → NavigationToolbar 추가 → "이미 잘린 기준 확대라 무의미"하다는 피드백 → 근본 원인(캔버스 최솟값 부족)을 수정하고 줌 버튼 제거.
+- **ORB 상세 표 위치**: 오른쪽 패널(300px)에 배치 시 너무 좁음 → 왼쪽 패널에 `tbl_top10` 옆에 나란히 배치(1:1 비율 `QHBoxLayout`).
+- **비타겟 이미지와 판별력 공식**:
+  - 초기: `avg(correct - best_wrong)` — 비타겟 이미지는 정답이 없어 `0 - best_wrong` (항상 음수), 전체 평균이 낮아짐
+  - 1차 수정: 비타겟 완전 제외 → "구별력 파악 용도를 잃는다"는 피드백
+  - **최종 공식**: `target_disc - nontarget_penalty`
+    - `target_disc` = 타겟 이미지 평균(correct - best_wrong)
+    - `nontarget_penalty` = 비타겟 이미지 평균(최고 매칭 수) — 비타겟을 높게 매칭할수록 패널티
+    - 두 목적을 함께 최적화, 표본 비율에 무관
+- **이미지 클릭 미리보기**: ORB 상세 표에서 파일명을 클릭하면 원본 이미지를 팝업으로 확인 요청.
+- **YOLO 다각형 원근 보정 확인**: bbox만 사용하던 코드를 `yolov8n-seg.pt` 폴리곤 마스크 → `_polygon_to_quad()` → `_perspective_warp()` 파이프라인으로 교체.
+- **그래프 간격**: 서브플롯 간격이 좁아 일부 라벨이 걸침 → `hspace`/`wspace` 수치 조정.
+
+### 🛠️ 코드 수정 내역
+
+**`gui/tab_param_viz.py`**
+
+#### dedup 중복 순위 제거
+- `_update_results_table` + `_on_top10_row_clicked` 양쪽에 동일 dedup 로직 적용
+  ```python
+  seen: dict = {}
+  for r in records:
+      key = tuple(r['params'][k] for k in PARAM_KEYS)
+      if key not in seen or r['score'] > seen[key]['score']:
+          seen[key] = r
+  top10 = sorted(seen.values(), ...)[:10]
+  ```
+
+#### tight_layout 여백 수정
+- 1D 그래프: `tight_layout(pad=2.0, rect=[0, 0.06, 1, 0.96])`
+- 최적화 그래프: `tight_layout(pad=2.0, rect=[0, 0.10, 1, 0.96])`
+- 리사이즈 핸들러: `tight_layout(pad=2.0, rect=[0, 0.10, 1, 0.96])`
+- `canvas.setMinimumWidth(600)` 추가
+
+#### 그래프 간격 확대
+- 1D outer `hspace=0.55`, inner `hspace=1.3, wspace=0.40`
+- 최적화 outer `hspace=0.65`
+
+#### 판별력 공식 `_eval_params` 개편
+- 타겟 이미지 → `target_margins.append(correct - best_wrong)`
+- 비타겟 이미지 → `nontarget_matches.append(max(sc.values()))`
+- 반환값: `float(np.mean(target_margins)) - float(np.mean(nontarget_matches))`
+
+#### YOLO 다각형 원근 보정
+- `_polygon_to_quad(polygon)`: TL/TR/BR/BL 4점 자동 추출 (sum/diff 기준)
+- `_perspective_warp(bgr_img, quad)`: `cv2.getPerspectiveTransform` + `cv2.warpPerspective`
+- `_yolo_crop()`: ① 폴리곤 → 원근 보정 ② bbox 폴백 ③ 원본 폴백
+
+#### ORB 상세 표 위치 이전
+- 오른쪽 패널 → 왼쪽 패널로 이전
+- `tbl_top10` 옆에 `QHBoxLayout(stretch=1)` 나란히 배치
+
+#### DetailEvalThread 확장
+- `rows` 딕셔너리에 `"path"`, `"is_target"` 필드 추가
+
+#### `_on_detail_finished` 색상 로직
+- 비타겟 행: `QColor("#F0F0F0")` 회색
+- 타겟 오판(disc < 0): `QColor("#FADBD8")` 빨강
+- 타겟 정판(disc ≥ 0): `QColor("#FFFFFF")` 흰색
+
+#### `_on_detail_image_clicked` 신설
+- 이미지명 셀 클릭 → 원본 파일 경로(`UserRole` 저장) 읽기
+- `cv2.imdecode` → `QImage` → `QPixmap.scaled(900, 650)` → `QDialog` 팝업 표시
+
+#### `_NumericTableItem` 클래스 신설
+- `QTableWidgetItem` 서브클래스, `__lt__` 오버라이드
+- `float(self.data(Qt.UserRole))` 비교 → 판별력 컬럼 숫자 정렬 정확도 보장
+
+### 📁 수정 대상 파일
+- `gui/tab_param_viz.py`
+
+---
+
+## [2026-04-10 33:00] 🧩 전처리 감도 분석 UI 전면 재설계 + 자동 수렴 탐색 추가 (tab_param_viz.py)
+
+### 💬 논의 및 결정 사항
+- **레이아웃 글자 겹침**: 컨트롤과 그래프가 세로로 쌓여 화면이 모자라고 텍스트가 겹치는 문제 제기. 오른쪽 패널 분리 방식으로 전면 재구성.
+- **중지 후 재시작 불가**: 분석을 중지하면 `btn_scan`이 다시 활성화되지 않아 재실행 방법이 없음. `stopped` 시그널로 해결.
+- **패럴렐 코디네이트 표 추가**: 시각화만으로는 상위 조합의 정확한 파라미터 값 파악이 어려움. 상위 10개 결과 표를 캔버스 아래에 추가.
+- **자동 수렴 탐색 모드**: 고정 횟수(예: 300회) 대신 "N회 연속 개선 없으면 자동 중지"하는 수렴 기반 탐색 요청.
+- **버튼 레이아웃 O O X 문제**: 프리셋 버튼(100 / 300 / 1000) 중 "1000"이 44px 안에 잘려 표시됨. 너비 확대로 해결.
+
+### 🛠️ 코드 수정 내역
+
+**`gui/tab_param_viz.py`** — ParamSensitivityTab 전면 개편
+
+#### 레이아웃 재구성 (좌우 분할)
+- 기존: `QVBoxLayout` — 컨트롤·그래프 세로 나열 → 글자 겹침
+- 변경: `QHBoxLayout` 최상위 분할
+  - **왼쪽** (`stretch=1`): matplotlib 캔버스 (min 360px) + 상위 10개 결과 `QTableWidget` (205px 고정)
+  - **오른쪽** (`QScrollArea`, 300px 고정): 데이터 소스·모드·설정·진행 상황·적용 버튼 전부 수직 배치
+- 그래프 영역과 컨트롤 패널이 물리적으로 분리되어 어떤 해상도에서도 겹침 없음
+
+#### FullOptThread 개선
+- `patience` 파라미터 추가 (기본 0 = 무제한)
+- `_no_improve_count` 내부 카운터: 개선 시 초기화, 미개선 시 증가
+- `patience > 0` 이고 `_no_improve_count >= patience`이면 `_stop = True` 자동 설정
+- `stopped = pyqtSignal(list, dict, float)` 추가: 수동 중지·자동 수렴 모두 이 시그널로 통보
+  - 기존: 수동 중지 시 `finished` 미발생 → `btn_scan` 영구 비활성
+  - 변경: `_run_inner` 종료 시 `_stop` 여부에 따라 `stopped` 또는 `finished` 분기 발생
+
+#### 분석 모드 3종으로 확장
+| 모드 | 라디오 버튼 | 동작 |
+|---|---|---|
+| 1D 감도 분석 | ⚡ 1D 감도 분석 (빠름) | 변수 하나씩 기본값 고정 스윕, ~50회 |
+| 전체 최적화 | 🔬 전체 공간 최적화 (권장) | LHS/TPE, 고정 횟수 |
+| 자동 수렴 | 🎯 자동 수렴 (개선 없으면 자동 중지) | LHS/TPE, patience 초과 시 자동 종료 |
+
+- 자동 수렴 모드: `n_trials=50000` (상한), `patience=spin_patience.value()`로 실질 제어
+- 진행 바: 자동 수렴 모드 시 patience 게이지로 전환 ("연속 미개선 N/patience")
+
+#### 중지 후 재시작 수정
+- `_on_opt_stopped(records, best_params, best_score)` 콜백 신설
+  - `btn_scan` 즉시 활성화
+  - 수집된 데이터로 그래프·표 즉시 업데이트
+  - 안내 문구: "중지됨 N회 시도 | 다시 시작: '분석 시작' 클릭"
+- `_stop_scan()`: 1D 스레드 `terminate()` 후에도 `btn_scan` 즉시 활성화
+
+#### 상위 10개 결과 표 (QTableWidget)
+- 컬럼: 순위 / 판별력 / CLAHE clip / CLAHE tile / 가우시안 블러 / 감마 / 샤프닝
+- 분석 완료, 수동 중지, 자동 수렴, 진행 중(_UPDATE_EVERY 주기) 모두 실시간 갱신
+- 1위 초록 배경, 2~3위 파란 배경 강조
+- `_update_results_table(records)` 메서드로 일원화
+
+#### 패럴렐 코디네이트 개선 (이전 세션 이어서 완성)
+- `height_ratios [2.2, 2.8]` → `[1, 1.2]`로 수정 — 상하 패널 비율 균등화
+- LHS 모드 시 수렴 곡선 안에 주석 추가: "LHS: 전 구간 균등 탐색 - 점이 고르게 분포하는 것이 정상"
+- 상위 25% 강조 → **상위 10개만 채색·굵게** 전환
+  - 나머지 전체: `alpha=0.04` 회색 배경선 (맥락 제공)
+  - 상위 10개: `alpha=0.92`, `linewidth=2.2`, RdYlGn 컬러맵
+  - 왼쪽에 `#1`~`#10` 순위 번호, 오른쪽에 실제 판별력 점수
+  - 축 눈금 = 실제 파라미터 값 (최솟값/중간값/최댓값) 표시
+
+#### 기타
+- 프리셋 버튼 너비 44px → 48px ("1000" 잘림 해결)
+- 임포트에 `QTableWidget, QTableWidgetItem, QHeaderView` 추가
+
+---
+
+## [2026-04-10 31:00] 🗂️ 전체 탭 재구성 + 감도 분석 개선 (main_window.py, tab_param_viz.py)
+
+### 💬 논의 및 결정 사항
+- **탭 순서 개편 요청**: 기존 7개 탭이 목적 순서 없이 나열되어 있어 사용성이 낮음. 목적별로 재정렬하고, 연관 탭은 통합.
+- **등고선 비율 문제**: 기존 레이아웃(5행 곡선 + 옆에 히트맵)에서 히트맵이 너무 좁고 길게 표시됨. 3×2 그리드 + 하단 전폭 히트맵으로 변경.
+- **YOLO 옵션 추가**: 파라미터 감도 분석 시 "YOLO 전처리 포함" 선택지 추가. 실제 파이프라인과 동일 조건(YOLO 크롭 후 ORB)으로 분석 가능.
+- **판별력 점수 설명**: 양수/음수/0의 의미를 UI에서 바로 확인할 수 있도록 설명 박스 추가.
+
+### 🛠️ 코드 수정 내역
+
+**`gui/main_window.py`** — 탭 전면 재설계
+- `TuningTab` 클래스 신설: 기존 GuideTab + ParamSensitivityTab + ImagePassSearchTab을 하나의 서브탭으로 통합
+- 탭 순서 변경 (7개 → 6개):
+  - 🎥 실시간 관제 (기존 1번 유지)
+  - 📱 모바일 앱 (기존 6번 → 2번으로 이동)
+  - 🏷 데이터 & 라벨링 (기존 4번 → 3번으로 이동)
+  - 🔧 파라미터 튜닝 (기존 파라미터 가이드 + 파라미터 시각화 통합 → 4번)
+  - 🌙 야간 학습 지시 (기존 2번 → 5번으로 이동)
+  - 📊 결재 대시보드 (기존 3번 → 6번으로 이동)
+- `params_saved` 시그널: TuningTab이 GuideTab으로부터 포워딩하여 monitor_tab 연결 유지
+- `_dummy_widget()` 헬퍼 함수: 탭 로드 실패 시 안전하게 플레이스홀더 표시
+
+**`gui/tab_param_viz.py`** — 감도 분석 대폭 개선
+- **레이아웃 수정**: `GridSpecFromSubplotSpec`으로 outer(상단/하단) + inner(3×2) 중첩 구성
+  - 상단: 3행×2열 감도 곡선 (5개 + 범례 설명 칸)
+  - 하단: 전폭(13인치) 2D 등고선 히트맵 — 가로 세로 비율 정상화
+- **YOLO 옵션**: `QCheckBox` "YOLO 전처리 포함" 추가 (Tab A/B 모두)
+  - 체크 시 YOLO(`data/yolo/yolov8n-seg.pt`)로 화면 영역 검출·크롭 후 ORB 수행
+  - YOLO 모델 미존재 시 자동 비활성화 (비활성 표시)
+  - `_yolo_crop()` 함수: YOLO 실패 시 원본 이미지 폴백
+- **판별력 점수 설명 박스** (`_make_score_info_widget()`): 탭 A 상단에 항시 표시
+  - 양수/음수/0 해석, 곡선 최고점 = 최적값, 히트맵 근사 방식 설명
+- **데이터 흐름 변경**: `test_items: [(gray, label)]` → `path_items: [(path, label)]`
+  - YOLO 크롭을 스레드 내부에서 원본 BGR 이미지에 적용 가능하도록 재설계
+  - `_load_paths_from_gt()`, `_load_paths_from_selection()` 함수 추가 (경로 기반)
+- **Tab B PASS/FAIL 바**: width_ratio `[1.3, 1]` → `[2.4, 0.65]` (바 폭 대폭 축소)
+
+---
+
+## [2026-04-10 30:00] 🔧 한국어 폰트 + 드래그 앤 드롭 + 라벨링 탭 다중 선택
+
+### 💬 논의 및 결정 사항
+- **한국어 폰트 깨짐**: matplotlib 기본 폰트가 한국어를 지원하지 않아 글자가 네모로 표시됨.
+- **드래그 앤 드롭**: Tab B(이미지 합격 탐색)에서 파일 대화상자 외에 드래그 앤 드롭으로 이미지 선택 요청.
+- **라벨링 탭 다중 선택**: 캡처 이미지 목록에서 일부만 골라 파라미터 감도 분석에 쓸 수 있도록 버튼 추가 요청.
+
+### 🛠️ 코드 수정 내역
+
+**`gui/tab_param_viz.py`**
+- `matplotlib.rcParams['font.family'] = 'Malgun Gothic'` — Windows 한국어 폰트
+- `matplotlib.rcParams['axes.unicode_minus'] = False` — 마이너스 기호 깨짐 방지
+- `_DropCanvas(FigureCanvas)` 클래스: `dragEnterEvent` / `dropEvent` 구현
+- `ImagePassSearchTab.dragEnterEvent` / `dropEvent`: 탭 전체에서도 드롭 수신
+- `_set_image()` → `_draw_preview()`: 선택 이미지 썸네일 미리보기
+
+**`gui/tab_labeling.py`**
+- `QAbstractItemView.ExtendedSelection` 모드 — Ctrl/Shift 다중 선택
+- "전체" / "해제" 버튼 + "N개 선택" 카운트 표시
+- "선택 이미지를 분석에 사용 ▶" 버튼 (보라색):
+  - 레이블 없는 이미지 자동 제외 + 경고
+  - `data/analysis_selection.json` 저장 → 파라미터 감도 분석 탭이 읽음
+
+---
+
+## [2026-04-10 29:00] 📏 레이아웃 비율 수정 + GT 기본 경로 + 라벨링 탭 다중 선택 초안
+
+### 💬 논의 및 결정 사항
+- 가로가 너무 길고 세로가 너무 짧거나 겹치는 문제 제기.
+- PASS/FAIL 바가 너무 넓은 문제 제기.
+- 기본 경로를 `data/gt_labeled/`로 자동 사용 요청.
+
+### 🛠️ 코드 수정 내역
+- `QScrollArea` 적용 + `canvas.setMinimumHeight(int(fig_h * DPI))` — 세로 스크롤 가능
+- Tab A width_ratios: `[1.4, 1]` → `[1.7, 1.0]` / Tab B: `[1.3, 1]` → `[2.2, 0.7]`
+- `GT_DIR = data/gt_labeled/` 시작 시 자동 로드
+- `SEL_FILE = data/analysis_selection.json` 연동
+
+---
+
+## [2026-04-09 28:00] 🔤 한국어 폰트 초기 적용 + 드래그 앤 드롭 1차
+
+### 💬 논의 및 결정 사항
+- matplotlib에서 한국어 폰트 Malgun Gothic 적용.
+- Tab B에 드래그 앤 드롭 지원.
+
+### 🛠️ 코드 수정 내역
+- `matplotlib.rcParams['font.family'] = 'Malgun Gothic'` 최초 적용.
+- `_DropCanvas` 클래스 신설.
+- `_draw_empty()` 점선 테두리 + 안내 문구.
+
+---
+
+## [2026-04-09 27:00] 📈 파라미터 시각화 탭 신설 (gui/tab_param_viz.py)
+
+### 💬 논의 및 결정 사항
+- **요청**: 전처리 파라미터(clahe_clip_limit, clahe_tile_grid, blur_ksize, gamma, sharpen_amount)가 판별력 점수에 미치는 영향을 그래프로 시각화. 2개 탭으로 구성.
+- **Tab A — 전처리 감도 분석**: 테스트 폴더 선택 → 각 파라미터를 스윕하여 1D 감도 곡선 + 상위 2개 파라미터 2D 등고선 히트맵 표시.
+- **Tab B — 이미지 합격 파라미터 탐색**: 특정 이미지 선택 → 각 파라미터 구간별 PASS/FAIL을 수평 컬러 바 + 점수 라인 차트로 표시.
+- **결정**: `matplotlib` (FigureCanvasQTAgg) 임베딩, `QThread` 백그라운드 계산, `ParamVizTab` 통합 위젯으로 구성.
+
+### 🛠️ 코드 수정 내역
+- **Added**: `gui/tab_param_viz.py`
+  - `PREP_PARAMS` — 5개 전처리 파라미터 정의 (이름, 스윕 값 목록, 기본값)
+  - `_preprocess()` — gray 이미지에 CLAHE/블러/감마/샤프닝 파이프라인 적용
+  - `_discriminability()` — ORB + BFMatcher로 판별력 점수(정답-오답 차) 계산
+  - `SensitivityScanThread` — 5개 파라미터 × N값 스윕, 테스트 이미지 전체 평균 판별력 계산
+  - `ParamSensitivityTab` — 1D 감도 곡선 × 5 + 상위 2개 파라미터 2D 등고선 히트맵 (matplotlib)
+  - `PassSearchThread` — 단일 이미지 × 5파라미터 스윕, PASS/FAIL 판정 (임계값 설정 가능)
+  - `ImagePassSearchTab` — 파라미터별 점수 라인 차트 + PASS/FAIL 수평 바 (초록/빨강)
+  - `ParamVizTab` — 두 탭을 하위 QTabWidget으로 통합
+- **Changed**: `gui/main_window.py`
+  - `from gui.tab_param_viz import ParamVizTab` 임포트 추가
+  - `self.param_viz_tab = ParamVizTab()` 인스턴스 생성
+  - `self.tabs.addTab(self.param_viz_tab, "  📈  파라미터 시각화  ")` 탭 등록
+
+---
+
 ## [2026-04-09 26:00] 📚 APK 트러블슈팅 참조 문서 신설
 
 ### 💬 논의 및 결정 사항

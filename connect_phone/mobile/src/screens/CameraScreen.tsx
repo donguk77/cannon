@@ -1,13 +1,14 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import {
   View, TouchableOpacity, Text, StyleSheet,
-  Dimensions, SafeAreaView, ActivityIndicator,
+  Dimensions, SafeAreaView, ActivityIndicator, AppState,
 } from 'react-native';
 import {
   Camera,
   useCameraDevice,
   useCameraPermission,
   useCameraFormat,
+  CameraRuntimeError,
 } from 'react-native-vision-camera';
 import * as ImagePicker from 'expo-image-picker';
 import OverlayView from '../components/OverlayView';
@@ -26,6 +27,10 @@ type Props = {
   onOpenSettings: () => void;
 };
 
+type ContentProps = Props & {
+  onRetry: () => void;
+};
+
 // ── 모드 메타 ──────────────────────────────────────────────────────────────
 const MODE_META: Record<Mode, { label: string; icon: string }> = {
   photo: { label: '사진', icon: '📸' },
@@ -40,6 +45,12 @@ const MODE_META: Record<Mode, { label: string; icon: string }> = {
 // Android 기기에서 발화되지 않아 스피너가 무한 돌게 되는 문제를 이 분리로 해결.
 export default function CameraScreen({ serverUrl, onOpenSettings }: Props) {
   const { hasPermission, requestPermission } = useCameraPermission();
+
+  // [버그 수정] retryKey를 CameraScreen 레벨에 두고 key prop으로 내려줌
+  // → "다시 시도" 시 CameraContent 전체를 언마운트/리마운트
+  //   (이전 코드의 deviceKey는 CameraContent 내부 state라 useCameraDevice를
+  //    재실행시키지 못했음 — timeout만 리셋되고 카메라 재탐색은 없었음)
+  const [retryKey, setRetryKey] = useState(0);
 
   useEffect(() => {
     if (!hasPermission) requestPermission();
@@ -59,11 +70,18 @@ export default function CameraScreen({ serverUrl, onOpenSettings }: Props) {
   }
 
   // 권한이 확인된 이후에만 마운트 → useCameraDevice가 항상 권한 있는 상태로 초기화
-  return <CameraContent serverUrl={serverUrl} onOpenSettings={onOpenSettings} />;
+  return (
+    <CameraContent
+      key={retryKey}
+      serverUrl={serverUrl}
+      onOpenSettings={onOpenSettings}
+      onRetry={() => setRetryKey(k => k + 1)}
+    />
+  );
 }
 
 // ── 실제 카메라 UI — 권한 보장 후 마운트 ──────────────────────────────────
-function CameraContent({ serverUrl, onOpenSettings }: Props) {
+function CameraContent({ serverUrl, onOpenSettings, onRetry }: ContentProps) {
   const [facing,    setFacing]    = useState<'back' | 'front'>('back');
   const [zoom,      setZoom]      = useState(1);
   const [torch,     setTorch]     = useState<'off' | 'on'>('off');
@@ -71,10 +89,23 @@ function CameraContent({ serverUrl, onOpenSettings }: Props) {
   const [streaming, setStreaming] = useState(false);
   const [busy,      setBusy]      = useState(false);
 
-  // device 탐색 실패 시 재시도를 위한 키
-  const [deviceKey, setDeviceKey] = useState(0);
   // 타임아웃 후 에러 표시용
   const [deviceTimeout, setDeviceTimeout] = useState(false);
+  // [버그 수정] 카메라 내부 오류 메시지 표시 (이전엔 onError 없어 무음 처리됨)
+  const [cameraError, setCameraError] = useState<string | null>(null);
+
+  // [버그 수정] AppState로 포그라운드/백그라운드 전환 감지
+  // → isActive를 AppState에 연동해 백그라운드 시 카메라를 해제
+  //   (이전 isActive={true} 하드코딩 → 복귀 시 Android가 카메라를 점유 중으로 판단해
+  //    초기화 실패하는 케이스 방어)
+  const [isAppActive, setIsAppActive] = useState(AppState.currentState === 'active');
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', state => {
+      setIsAppActive(state === 'active');
+    });
+    return () => sub.remove();
+  }, []);
 
   const device      = useCameraDevice(facing);
   const cameraRef   = useRef<Camera>(null);
@@ -85,17 +116,18 @@ function CameraContent({ serverUrl, onOpenSettings }: Props) {
   useEffect(() => {
     if (device) {
       setDeviceTimeout(false);
+      setCameraError(null);
       return;
     }
     const timer = setTimeout(() => setDeviceTimeout(true), 8000);
     return () => clearTimeout(timer);
-  }, [device, deviceKey]);
+  }, [device]);
 
   const minZoom = device?.minZoom ?? 1;
   const maxZoom = Math.min(device?.maxZoom ?? 8, 8);
 
   const format = useCameraFormat(device, [
-    { videoResolution: { width: 1280, height: 720 } },
+    { videoResolution: { width: 1280, height: 960 } },  // 4:3 (portrait 3:4)
   ]);
 
   const { wsState, result, latencyMs, sendFrame } = useWebSocket(serverUrl);
@@ -184,14 +216,13 @@ function CameraContent({ serverUrl, onOpenSettings }: Props) {
     return (
       <View style={styles.fullDark}>
         <View style={styles.centerBox}>
-          {deviceTimeout ? (
+          {deviceTimeout || cameraError ? (
             <>
               <Text style={styles.msgText}>카메라를 찾을 수 없습니다</Text>
-              <Text style={styles.msgSub}>기기가 카메라를 인식하지 못했습니다</Text>
-              <TouchableOpacity
-                style={styles.primaryBtn}
-                onPress={() => { setDeviceTimeout(false); setDeviceKey(k => k + 1); }}
-              >
+              <Text style={styles.msgSub}>
+                {cameraError ?? '기기가 카메라를 인식하지 못했습니다'}
+              </Text>
+              <TouchableOpacity style={styles.primaryBtn} onPress={onRetry}>
                 <Text style={styles.primaryBtnText}>다시 시도</Text>
               </TouchableOpacity>
             </>
@@ -212,12 +243,12 @@ function CameraContent({ serverUrl, onOpenSettings }: Props) {
   // zombie-stabilize: 새 프레임을 보내는 중에도 마지막 result를 그대로 유지
   const overlayResult = isConnected ? result : null;
 
-  // ── 레터박스 카메라 크기 (16:9, 전체 너비 기준) ─────────────────────────
-  // aspectRatio = width/height. portrait에서 9:16 → 9/16
+  // ── 레터박스 카메라 크기 (3:4, 전체 너비 기준) ──────────────────────────
+  // aspectRatio = width/height. portrait에서 3:4 → 3/4
   // (StyleSheet에서 계산하면 타입 오류 가능성 있어 변수로 분리)
   const camBoxStyle = {
     width: '100%' as const,
-    aspectRatio: 9 / 16,
+    aspectRatio: 3 / 4,
     overflow: 'hidden' as const,
     backgroundColor: '#111',
   };
@@ -253,10 +284,14 @@ function CameraContent({ serverUrl, onOpenSettings }: Props) {
               style={StyleSheet.absoluteFill}
               device={device}
               format={format}
-              isActive={true}
+              isActive={isAppActive}
               photo={true}
               zoom={zoom}
               torch={torch}
+              onError={(e: CameraRuntimeError) => {
+                // [버그 수정] 카메라 런타임 오류 → 에러 메시지 표시 + 재시도 유도
+                setCameraError(`${e.code}: ${e.message}`);
+              }}
             />
           )}
 
@@ -290,7 +325,7 @@ function CameraContent({ serverUrl, onOpenSettings }: Props) {
             wsState={wsState}
             latencyMs={latencyMs}
             cameraWidth={SCREEN_W}
-            cameraHeight={SCREEN_W * 16 / 9}
+            cameraHeight={SCREEN_W * 4 / 3}
           />
         </View>
       </View>
@@ -421,6 +456,7 @@ const styles = StyleSheet.create({
     color: '#888',
     fontSize: 13,
     textAlign: 'center',
+    paddingHorizontal: 32,
   },
   primaryBtn: {
     backgroundColor: '#3498DB',

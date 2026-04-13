@@ -53,7 +53,7 @@ def run_pipeline(video_path: str):
         print(f"[2/5] ⚠️  YOLO 모델 파일 없음 → 베젤 탐지 생략, 원본 프레임 전체 사용")
         print(f"      (학습 후 {YOLO_MODEL_PATH} 에 모델 파일을 넣어주세요)")
 
-    matcher = ScreenMatcher(orb_nfeatures=700, lowe_ratio=0.75, match_threshold=25)
+    matcher = ScreenMatcher(orb_nfeatures=700, lowe_ratio=0.75, orb_compare_threshold=25)
     print("[3/5] ORB 특징점 매처(Matcher) 초기화 완료")
 
     # 타겟 이미지 로드

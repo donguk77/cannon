@@ -32,11 +32,11 @@ C_PURPLE = "#9B59B6"
 DEFAULT_CONFIG = {
     "nfeatures": 700,
     "lowe_ratio": 0.75,
-    "match_threshold": 25,
+    "orb_compare_threshold": 25,
     "roi_match_threshold": 7,
     "clahe_clip_limit": 2.0,
     "clahe_tile_grid": 8,
-    "MATCH_THRESHOLD": 60,
+    "final_pass_threshold": 60,
     "yolo_imgsz": 640,
     "blur_ksize": 0,
     "gamma": 1.0,
@@ -50,6 +50,11 @@ def load_params_config() -> dict:
         try:
             with open(PARAMS_CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
+            # 하위 호환: 구 키 → 신 키 (기존 params_config.json 자동 변환)
+            if "match_threshold" in cfg and "orb_compare_threshold" not in cfg:
+                cfg["orb_compare_threshold"] = cfg.pop("match_threshold")
+            if "MATCH_THRESHOLD" in cfg and "final_pass_threshold" not in cfg:
+                cfg["final_pass_threshold"] = cfg.pop("MATCH_THRESHOLD")
             return {**DEFAULT_CONFIG, **cfg}
         except Exception:
             pass
@@ -218,19 +223,22 @@ class GroundTruthOptimizerThread(QThread):
             avg_correct    = float(np.mean(correct_scores)) if correct_scores else 0.0
             avg_wrong      = float(np.mean(wrong_highs))    if wrong_highs    else 0.0
             avg_neg_max    = float(np.mean(neg_max_scores)) if neg_max_scores else 0.0
-            fp_count       = sum(1 for s in neg_max_scores if s > 0)
 
             if avg_margin > best_margin:
                 best_margin  = avg_margin
                 roi_thr      = max(3, round(avg_wrong * 0.12) + 2)
-                match_thr    = max(5, int(avg_wrong) + 2)
+                # 정답/오답 점수 분포 사이의 중간값을 임계값으로 사용
+                # avg_wrong + 2 방식은 avg_correct가 avg_wrong에 가까울 때 정답도 FAIL시킬 수 있음
+                match_thr    = max(5, int((avg_correct + avg_wrong) / 2))
+                # 오탐 기준: 실제로 threshold 이상 점수가 나온 경우만 집계 (s > 0은 과도하게 엄격)
+                fp_count     = sum(1 for s in neg_max_scores if s >= match_thr)
                 best_params  = {
-                    "nfeatures":           nf,
-                    "lowe_ratio":          lr,
-                    "clahe_clip_limit":    cl,
-                    "clahe_tile_grid":     ct,
-                    "match_threshold":     match_thr,
-                    "roi_match_threshold": roi_thr,
+                    "nfeatures":            nf,
+                    "lowe_ratio":           lr,
+                    "clahe_clip_limit":     cl,
+                    "clahe_tile_grid":      ct,
+                    "orb_compare_threshold": match_thr,
+                    "roi_match_threshold":  roi_thr,
                 }
                 pos_n   = len(test_data)
                 neg_n   = len(neg_data)
@@ -260,8 +268,8 @@ class GroundTruthOptimizerThread(QThread):
                     f"{neg_block}"
                     f"\n[종합 평균 판별 마진 (↑ 좋음): {avg_margin:.1f}]\n"
                     f"\n[자동 권장 임계값]\n"
-                    f"  match_threshold     = {match_thr}\n"
-                    f"  roi_match_threshold = {roi_thr}"
+                    f"  orb_compare_threshold = {match_thr}\n"
+                    f"  roi_match_threshold   = {roi_thr}"
                 )
 
         self.finished.emit(best_params, best_text)
@@ -511,13 +519,16 @@ class ParamOptimizerThread(QThread):
                 best_gap    = gap
                 # ROI 크롭은 전체 이미지의 약 10~15% 면적 → 교차 점수도 비례 감소
                 roi_thr = max(3, round(max_cross * 0.12) + 2)
+                # 자기 매칭 최솟값과 교차 매칭 최댓값의 중간값을 임계값으로 사용
+                # max_cross + 2 방식은 gap이 작을 때 정답(min_self)도 FAIL시킬 수 있음
+                orb_thr = max(5, (min_self + max_cross) // 2)
                 best_params = {
-                    "nfeatures":          nf,
-                    "lowe_ratio":         lr,
-                    "clahe_clip_limit":   cl,
-                    "clahe_tile_grid":    ct,
-                    "match_threshold":    max(5, max_cross + 2),
-                    "roi_match_threshold": roi_thr,
+                    "nfeatures":             nf,
+                    "lowe_ratio":            lr,
+                    "clahe_clip_limit":      cl,
+                    "clahe_tile_grid":       ct,
+                    "orb_compare_threshold": orb_thr,
+                    "roi_match_threshold":   roi_thr,
                 }
                 self_str  = "  ".join(f"{f[0]}: {s}쌍"
                                       for f, s in zip(features, self_scores))
@@ -532,8 +543,8 @@ class ParamOptimizerThread(QThread):
                     f"  타겟 간 교차 매칭 최대        : {max_cross}쌍\n"
                     f"  판별력 갭 (↑ 클수록 좋음)    : {gap}\n"
                     f"\n[자동 권장 임계값]\n"
-                    f"  match_threshold     = {best_params['match_threshold']}  (전체이미지 폴백)\n"
-                    f"  roi_match_threshold = {roi_thr}  (ROI 크롭 기준 추정)"
+                    f"  orb_compare_threshold = {best_params['orb_compare_threshold']}  (전체이미지 폴백)\n"
+                    f"  roi_match_threshold   = {roi_thr}  (ROI 크롭 기준 추정)"
                 )
 
         self.finished.emit(best_params, best_text)
@@ -711,7 +722,7 @@ PARAMS = [
         "step": 0.05,
     },
     {
-        "name": "match_threshold",
+        "name": "orb_compare_threshold",
         "full_name": "전체 이미지 매칭 컷오프",
         "category": "ORB 특징점 추출",
         "category_color": C_BLUE,
@@ -727,7 +738,7 @@ PARAMS = [
         "up":   "합격 기준이 높아져 오탐(False Positive)은 줄지만\n타겟과 일치해도 FAIL로 빠질 확률이 늘어납니다.",
         "down": "합격이 쉬워지지만 다른 화면도 PASS가 될 수 있습니다.",
         "tip":  "ROI를 제대로 설정했다면 이 값은 건드릴 필요가 거의 없습니다.",
-        "param_key": "match_threshold",
+        "param_key": "orb_compare_threshold",
         "input_type": "int",
         "val_min": 5,
         "val_max": 100,
@@ -745,7 +756,7 @@ PARAMS = [
         "detail": (
             "전체 이미지가 아닌 ROI 영역만 잘라서 비교할 때의 컷오프입니다.\n"
             "ROI는 작은 영역이라 전체 이미지보다 특징점 수가 훨씬 적습니다.\n"
-            "그래서 match_threshold(25)보다 훨씬 낮은 값을 씁니다."
+            "그래서 orb_compare_threshold(25)보다 훨씬 낮은 값을 씁니다."
         ),
         "up":   "각 ROI 합격 기준이 높아지므로 ROI 매칭 통과가 어려워집니다.",
         "down": "ROI 기준이 낮아져 오탐 가능성이 있습니다.",
@@ -941,8 +952,8 @@ PARAMS = [
 
     # ── 시스템 임계값 ─────────────────────────────────────────────────────────
     {
-        "name": "MATCH_THRESHOLD",
-        "full_name": "MATCH_THRESHOLD (최종 합격 기준)",
+        "name": "final_pass_threshold",
+        "full_name": "final_pass_threshold (최종 합격 기준)",
         "category": "시스템 임계값",
         "category_color": C_GREEN,
         "default": "60",
@@ -957,7 +968,7 @@ PARAMS = [
         "up":   "합격 기준이 높아져 FAIL이 많아집니다.\n→ pending 폴더에 이미지가 쌓이고 야간 학습 부담이 늘어납니다.",
         "down": "합격이 쉬워집니다.\n→ 다른 화면도 PASS될 수 있어 검사 신뢰도가 떨어집니다.",
         "tip":  "초기 운영 중에는 낮게(40~50) 설정하고, ORB 파라미터를 튜닝한 뒤\n점수 분포가 안정되면 60~70으로 올리는 것을 권장합니다.",
-        "param_key": "MATCH_THRESHOLD",
+        "param_key": "final_pass_threshold",
         "input_type": "int",
         "val_min": 30,
         "val_max": 100,
@@ -965,7 +976,7 @@ PARAMS = [
     },
 ]
 # NOTE: PENDING_THRESHOLD 항목은 제거됨.
-# pending 저장 방식이 고정 임계값에서 MATCH_THRESHOLD 기준 ±margin(2~3점) Hard Mining으로
+# pending 저장 방식이 고정 임계값에서 final_pass_threshold 기준 ±margin(2~3점) Hard Mining으로
 # 변경되어 이 파라미터는 더 이상 동작에 영향을 주지 않습니다.
 
 
